@@ -1,0 +1,25 @@
+[Unit]
+Description=XPAV - Chi Rho Anti-Virus (REIUK LTD)
+Documentation=https://github.com/reiuk/xpav
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xpav --metrics-addr 127.0.0.1:9090
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=no  # Needed for some monitors
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadOnlyPaths=/
+ReadWritePaths=/var/log
+
+# Capabilities for monitors
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

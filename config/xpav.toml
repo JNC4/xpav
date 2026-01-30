@@ -1,0 +1,95 @@
+# XPAV Configuration
+# Chi Rho Anti-Virus - Behavioral Linux Security Daemon
+
+[general]
+log_level = "info"
+log_format = "json"  # or "text"
+# alert_webhook = "https://your-webhook-url/alerts"
+dry_run = false
+
+[process_monitor]
+enabled = true
+scan_interval_ms = 1000
+
+# Paths where execution is suspicious
+suspicious_paths = [
+    "/tmp",
+    "/dev/shm",
+    "/var/tmp",
+    "/run/user",
+]
+
+# Command-line patterns indicating cryptomining
+miner_patterns = [
+    # Mining pool protocols
+    "stratum+tcp://",
+    "stratum+ssl://",
+    "stratum://",
+    # XMRig specific
+    "xmrig",
+    "--donate-level",
+    "--cpu-priority",
+    "-o pool.",
+    "--coin=",
+    # Other miners
+    "minerd",
+    "cpuminer",
+    "cgminer",
+    "ethminer",
+    # Mining pool hostnames
+    "pool.minexmr",
+    "supportxmr",
+    "nanopool.org",
+    "hashvault.pro",
+    "moneroocean",
+    "2miners.com",
+    "nicehash",
+]
+
+# Process names known to be malicious
+suspicious_process_names = [
+    "kdevtmpfsi",
+    "kinsing",
+    "dbused",
+    ".rsync",
+]
+
+# Action on detection: "alert", "kill", or "block"
+action = "alert"
+
+[network_monitor]
+enabled = true
+scan_interval_ms = 1000
+
+# Domains to block (mining pools, known C2)
+blocked_domains = [
+    # Monero pools
+    "pool.minexmr.com",
+    "xmrpool.eu",
+    "supportxmr.com",
+    "xmr.nanopool.org",
+    "moneroocean.stream",
+    "hashvault.pro",
+    "xmr.2miners.com",
+    # Multi-coin pools
+    "nicehash.com",
+    "miningpoolhub.com",
+    "f2pool.com",
+    "antpool.com",
+]
+
+# IP addresses to block (add known C2 IPs here)
+blocked_ips = []
+
+# URLs to fetch additional blocklists from
+blocklist_urls = []
+
+action = "alert"
+
+[persistence_monitor]
+enabled = true
+watch_crontab = true
+watch_ssh_keys = true
+watch_systemd = true
+watch_ld_preload = true
+action = "alert"

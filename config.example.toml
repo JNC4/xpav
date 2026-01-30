@@ -1,0 +1,58 @@
+# XPAV Configuration Example
+# Copy to /etc/xpav/config.toml
+
+[general]
+log_level = "info"
+log_format = "json"  # or "text"
+dry_run = false
+# alert_webhook = "https://hooks.slack.com/services/xxx/yyy/zzz"
+
+[process_monitor]
+enabled = true
+scan_interval_ms = 1000
+monitor_cpu = true
+cpu_threshold = 50.0        # Alert if miner pattern + >50% CPU
+high_cpu_threshold = 90.0   # Alert on >90% CPU even without pattern
+alert_high_cpu_unknown = false
+track_ancestry = false      # Enable to detect web server -> shell spawns
+
+[network_monitor]
+enabled = true
+scan_interval_ms = 1000
+# Additional IPs to block (mining pools are built-in)
+blocked_ips = []
+
+[persistence_monitor]
+enabled = true
+watch_crontab = true
+watch_ssh_keys = true
+watch_systemd = true
+watch_ld_preload = true
+
+[file_monitor]
+enabled = false  # Requires root (fanotify)
+scan_new_files = true
+block_suspicious_exec = false  # Set true to block, may break sites
+obfuscation_threshold = 50
+watch_paths = ["/var/www", "/srv/http"]
+
+[ebpf_monitor]
+enabled = false  # Requires root and bpftool
+scan_interval_ms = 5000
+auto_baseline = true
+alert_on_new_programs = true
+
+[memory_scanner]
+enabled = false  # Requires root
+scan_interval_ms = 30000
+
+[integrity_monitor]
+enabled = false  # Requires initial baseline
+scan_interval_ms = 60000
+auto_baseline = true
+
+[container_monitor]
+enabled = false  # Only useful in container environments
+detect_escapes = true
+monitor_namespaces = true
+monitor_privileged = true

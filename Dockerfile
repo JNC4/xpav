@@ -1,0 +1,25 @@
+# Build stage
+FROM rust:1.83-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --release
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/xpav /usr/local/bin/xpav
+
+# Default config location
+VOLUME /etc/xpav
+
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/xpav"]
+CMD ["--metrics-addr", "0.0.0.0:9090"]
