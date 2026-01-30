@@ -1,5 +1,7 @@
 # XPAV - Chi Rho Anti-Virus
 
+> **Note:** This project is not actively maintained and exists for reference purposes only.
+
 ```
   __  __ ____   ___  __    __
    \ \/ // __ \ / _ \ \ \  / /
