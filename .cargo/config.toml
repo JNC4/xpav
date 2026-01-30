@@ -1,0 +1,13 @@
+# Cargo configuration for xpav workspace
+
+[alias]
+# Run xtask commands easily: `cargo xtask build-ebpf`
+xtask = "run --package xtask --"
+
+[target.bpfel-unknown-none]
+# eBPF programs are linked by bpf-linker
+# Note: --unresolved-symbols flag removed - not supported in bpf-linker 0.9+
+
+[build]
+# Use workspace target directory for all crates
+target-dir = "target"

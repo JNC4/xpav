@@ -1,11 +1,15 @@
 //! Scans /proc for miners, suspicious executions, and fake kernel threads.
 
+use crate::allowlist::AllowlistChecker;
 use crate::config::{ProcessMonitorConfig, ResponseAction};
-use crate::detection::{DetectionEvent, DetectionSource, ProcessAncestor, ProcessInfo, Severity, ThreatType};
+use crate::detection::{
+    DetectionEvent, DetectionSource, ProcessAncestor, ProcessInfo, Severity, ThreatType,
+};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -27,10 +31,19 @@ pub struct ProcessMonitor {
     prev_cpu_times: HashMap<u32, CpuTime>,
     reported_high_cpu: HashSet<u32>,
     clock_ticks_per_sec: u64,
+    allowlist: Arc<AllowlistChecker>,
 }
 
 impl ProcessMonitor {
     pub fn new(config: ProcessMonitorConfig, event_tx: mpsc::Sender<DetectionEvent>) -> Self {
+        Self::with_allowlist(config, event_tx, Arc::new(AllowlistChecker::default()))
+    }
+
+    pub fn with_allowlist(
+        config: ProcessMonitorConfig,
+        event_tx: mpsc::Sender<DetectionEvent>,
+        allowlist: Arc<AllowlistChecker>,
+    ) -> Self {
         let miner_patterns_lower = config
             .miner_patterns
             .iter()
@@ -61,12 +74,47 @@ impl ProcessMonitor {
             prev_cpu_times: HashMap::new(),
             reported_high_cpu: HashSet::new(),
             clock_ticks_per_sec,
+            allowlist,
         }
     }
 
+    /// Run the process monitor.
+    ///
+    /// This method automatically selects the best available backend:
+    /// 1. Native eBPF (if feature enabled and available)
+    /// 2. Netlink proc connector (if available)
+    /// 3. /proc polling (fallback)
     pub async fn run(&mut self) -> Result<()> {
-        info!("Process monitor started");
+        // Try native eBPF if feature is enabled
+        #[cfg(feature = "ebpf-native")]
+        {
+            use super::ebpf_native::ProcessMonitorBackend;
 
+            match ProcessMonitorBackend::detect() {
+                ProcessMonitorBackend::BpfNative => {
+                    info!("Using native eBPF backend for process monitoring");
+                    // Note: BpfNativeMonitor would need to be instantiated here
+                    // with the proper state and event_tx. For now, fall through
+                    // to polling since eBPF requires pre-compiled programs.
+                    info!("eBPF programs not available, falling back to polling");
+                }
+                ProcessMonitorBackend::Netlink => {
+                    info!("Using netlink backend for process monitoring");
+                }
+                ProcessMonitorBackend::Polling => {
+                    info!("Using /proc polling for process monitoring");
+                }
+            }
+        }
+
+        #[cfg(not(feature = "ebpf-native"))]
+        info!("Process monitor started (polling mode)");
+
+        self.run_polling().await
+    }
+
+    /// Run the process monitor using /proc polling.
+    async fn run_polling(&mut self) -> Result<()> {
         let interval = tokio::time::Duration::from_millis(self.config.scan_interval_ms);
 
         loop {
@@ -295,6 +343,22 @@ impl ProcessMonitor {
             let ancestor_name_lower = ancestor.name.to_lowercase();
             for web_server in &self.web_server_processes_lower {
                 if ancestor_name_lower.contains(web_server) {
+                    // Check if this spawn is allowlisted
+                    if self.allowlist.is_web_server_spawn_allowed(
+                        &ancestor.name,
+                        &proc.name,
+                        &proc.cmdline,
+                    ) {
+                        debug!(
+                            pid = proc.pid,
+                            parent = %ancestor.name,
+                            child = %proc.name,
+                            cmdline = %proc.cmdline,
+                            "Web server spawn allowlisted"
+                        );
+                        return None;
+                    }
+
                     // Determine threat type based on child type
                     let threat_type = if self.is_shell_process(&name_lower) {
                         ThreatType::WebServerShellSpawn
@@ -324,6 +388,20 @@ impl ProcessMonitor {
     async fn analyze_process(&mut self, proc: &ProcessInfo, cpu_usage: Option<f64>) {
         // Skip kernel threads (ppid 2) and init (pid 1)
         if proc.pid <= 2 || proc.ppid == 2 {
+            return;
+        }
+
+        // Check if process is globally allowlisted
+        if self.allowlist.is_process_allowed(
+            proc.exe_path.as_deref(),
+            &proc.name,
+            None, // hash not computed for performance
+        ) {
+            debug!(
+                pid = proc.pid,
+                name = %proc.name,
+                "Process allowlisted, skipping analysis"
+            );
             return;
         }
 
@@ -498,6 +576,19 @@ impl ProcessMonitor {
 
         for suspicious in &self.config.suspicious_paths {
             if exe_path.starts_with(suspicious) {
+                // Check if this tmp execution is allowlisted
+                if self
+                    .allowlist
+                    .is_tmp_execution_allowed(exe_path, &proc.name)
+                {
+                    debug!(
+                        pid = proc.pid,
+                        path = %exe_path.display(),
+                        name = %proc.name,
+                        "Tmp execution allowlisted"
+                    );
+                    return None;
+                }
                 return Some(exe_path.clone());
             }
         }

@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition = "2021"
+description = "Build tasks for xpav (eBPF compilation, etc.)"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }

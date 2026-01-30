@@ -3,22 +3,24 @@
 //! Real-time file monitoring using the Linux fanotify API.
 //! Watches web roots for new/modified files and scans them for webshells.
 //!
+//! Supports context-aware scanning for false positive reduction.
+//!
 //! Requires CAP_SYS_ADMIN (root) to operate.
 
-use crate::config::{FileMonitorConfig, ResponseAction};
+use crate::allowlist::AllowlistChecker;
+use crate::config::{FalsePositiveReductionConfig, FileMonitorConfig, ResponseAction};
 use crate::detection::{
     DetectionEvent, DetectionSource, FileEventType, FileInfo, Severity, ThreatType,
 };
-use crate::scanner::WebshellScanner;
+use crate::scanner::{FrameworkDetector, ScanContext, WebshellScanner};
 use anyhow::{Context, Result};
-use nix::sys::fanotify::{
-    EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags,
-};
+use nix::sys::fanotify::{EventFFlags, Fanotify, InitFlags, MarkFlags, MaskFlags};
 use std::collections::HashSet;
 use std::fs;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tokio::sync::mpsc;
@@ -26,13 +28,30 @@ use tracing::{debug, error, info, warn};
 
 pub struct FanotifyMonitor {
     config: FileMonitorConfig,
+    fp_config: FalsePositiveReductionConfig,
     event_tx: mpsc::Sender<DetectionEvent>,
     scanner: WebshellScanner,
     scan_extensions: HashSet<String>,
+    framework_detector: Arc<FrameworkDetector>,
+    allowlist: Arc<AllowlistChecker>,
 }
 
 impl FanotifyMonitor {
     pub fn new(config: FileMonitorConfig, event_tx: mpsc::Sender<DetectionEvent>) -> Self {
+        Self::with_fp_config(
+            config,
+            FalsePositiveReductionConfig::default(),
+            event_tx,
+            Arc::new(AllowlistChecker::default()),
+        )
+    }
+
+    pub fn with_fp_config(
+        config: FileMonitorConfig,
+        fp_config: FalsePositiveReductionConfig,
+        event_tx: mpsc::Sender<DetectionEvent>,
+        allowlist: Arc<AllowlistChecker>,
+    ) -> Self {
         let scanner = WebshellScanner::new(config.obfuscation_threshold);
         let scan_extensions: HashSet<String> = config
             .scan_extensions
@@ -42,9 +61,12 @@ impl FanotifyMonitor {
 
         Self {
             config,
+            fp_config,
             event_tx,
             scanner,
             scan_extensions,
+            framework_detector: Arc::new(FrameworkDetector::new()),
+            allowlist,
         }
     }
 
@@ -161,9 +183,51 @@ impl FanotifyMonitor {
 
     /// Scan a file for webshell patterns
     async fn scan_file(&self, path: &Path) -> Result<()> {
+        // Check if file is allowlisted
+        if self.allowlist.is_file_allowed(path, None) {
+            debug!(path = %path.display(), "File allowlisted, skipping scan");
+            return Ok(());
+        }
+
         let content = fs::read_to_string(path).context("Failed to read file")?;
 
-        let result = self.scanner.scan(&content);
+        // Build scan context if context-aware scanning is enabled
+        let result = if self.fp_config.context_scoring {
+            let context = ScanContext::from_path_with_detector(path, Some(&self.framework_detector));
+
+            // Check for suppressed categories
+            let suppressed = self.allowlist.get_suppressed_categories(path);
+
+            // Use context-aware scanning
+            let mut result = self.scanner.scan_with_context(&content, &context);
+
+            // Filter out suppressed detections
+            if !suppressed.is_empty() {
+                result.detections.retain(|d| {
+                    let category_name = format!("{:?}", d.category);
+                    !suppressed.contains(&category_name)
+                });
+
+                // Recalculate threat level after filtering
+                if result.detections.is_empty() {
+                    result.threat_level = crate::scanner::webshell::ThreatLevel::Clean;
+                    result.is_malicious = false;
+                }
+            }
+
+            debug!(
+                path = %path.display(),
+                framework = ?context.framework,
+                is_vendor = context.is_vendor,
+                is_minified = context.is_minified,
+                score_multiplier = context.score_multiplier,
+                "Context-aware scan completed"
+            );
+
+            result
+        } else {
+            self.scanner.scan(&content)
+        };
 
         if result.is_malicious {
             let threat_type = if result.obfuscation_score >= self.config.obfuscation_threshold * 2 {

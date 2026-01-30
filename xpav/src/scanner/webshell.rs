@@ -5,9 +5,14 @@
 //! - JSP (jsp, jspx, jspa, jsw, jsv)
 //! - ASP.NET (aspx, ashx, asmx, ascx, asp)
 //! - Python (py, pyw)
+//!
+//! Also supports context-aware scanning to reduce false positives
+//! in known frameworks and vendor directories.
 
 use regex::Regex;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use super::framework::{Framework, FrameworkDetector};
 
 /// Supported webshell languages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +70,115 @@ pub enum DetectionCategory {
     Obfuscation,
     SuspiciousFunction,
     DynamicExecution,
+}
+
+/// Context for scanning that affects scoring and detection behavior.
+#[derive(Debug, Clone, Default)]
+pub struct ScanContext {
+    /// Path to the file being scanned.
+    pub path: Option<PathBuf>,
+    /// Detected framework for the file.
+    pub framework: Option<Framework>,
+    /// Whether the content appears to be minified/bundled.
+    pub is_minified: bool,
+    /// Whether the file is in a vendor directory.
+    pub is_vendor: bool,
+    /// Whether the file is in a cache directory.
+    pub is_cache: bool,
+    /// Score multiplier (1.0 = normal, 0.5 = half score, etc.).
+    pub score_multiplier: f32,
+}
+
+impl ScanContext {
+    /// Create a new scan context with default values.
+    pub fn new() -> Self {
+        Self {
+            score_multiplier: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Create a scan context from a file path.
+    pub fn from_path(path: &Path) -> Self {
+        Self::from_path_with_detector(path, None)
+    }
+
+    /// Create a scan context from a file path with an optional framework detector.
+    pub fn from_path_with_detector(path: &Path, detector: Option<&FrameworkDetector>) -> Self {
+        let is_vendor = FrameworkDetector::is_vendor_path(path);
+        let is_cache = FrameworkDetector::is_cache_path(path);
+
+        let framework = detector.and_then(|d| d.detect_from_path(path));
+
+        // Calculate score multiplier based on context
+        let mut score_multiplier = 1.0;
+        if is_vendor {
+            score_multiplier *= 0.5;
+        }
+        if is_cache {
+            score_multiplier *= 0.3;
+        }
+        if let Some(Framework::WordPress) = framework {
+            if FrameworkDetector::is_wordpress_core_or_plugin(path) {
+                score_multiplier *= 0.5;
+            }
+        }
+
+        Self {
+            path: Some(path.to_path_buf()),
+            framework,
+            is_minified: false, // Set later after content analysis
+            is_vendor,
+            is_cache,
+            score_multiplier,
+        }
+    }
+
+    /// Set minified flag and adjust multiplier.
+    pub fn with_minified(mut self, is_minified: bool) -> Self {
+        self.is_minified = is_minified;
+        if is_minified {
+            self.score_multiplier *= 0.5;
+        }
+        self
+    }
+}
+
+/// Check if content appears to be minified JavaScript/CSS/PHP.
+pub fn is_likely_minified(content: &str) -> bool {
+    // Check for sourceMappingURL (definitive indicator)
+    if content.contains("sourceMappingURL") || content.contains("sourceURL") {
+        return true;
+    }
+
+    // Calculate average line length
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+
+    let total_chars: usize = lines.iter().map(|l| l.len()).sum();
+    let avg_line_length = total_chars / lines.len();
+
+    // Minified code typically has very long lines (>500 chars average)
+    if avg_line_length > 500 {
+        return true;
+    }
+
+    // Check for minified patterns: very few newlines relative to content size
+    let newline_ratio = lines.len() as f64 / content.len() as f64;
+    if content.len() > 10000 && newline_ratio < 0.001 {
+        return true;
+    }
+
+    // Check for common minifier patterns (chained semicolons, no spaces)
+    let no_space_semicolons = content.matches(";").count();
+    let spaced_semicolons = content.matches("; ").count() + content.matches(";\n").count();
+    if no_space_semicolons > 50 && spaced_semicolons < no_space_semicolons / 10 {
+        return true;
+    }
+
+    false
 }
 
 pub struct WebshellScanner {
@@ -257,6 +371,126 @@ impl WebshellScanner {
             WebshellLanguage::AspNet => self.scan_asp(content),
             WebshellLanguage::Python => self.scan_python(content),
         }
+    }
+
+    /// Scan content with context awareness for false positive reduction.
+    ///
+    /// This method applies context-based score adjustments to reduce false
+    /// positives from legitimate framework code, vendor directories, and
+    /// minified/bundled code.
+    pub fn scan_with_context(&self, content: &str, context: &ScanContext) -> WebshellScanResult {
+        // Detect language from path if available
+        let language = context
+            .path
+            .as_ref()
+            .and_then(|p| Self::should_scan_language(p))
+            .unwrap_or(WebshellLanguage::Php);
+
+        // Get base scan result
+        let mut result = self.scan_language(content, language);
+
+        // Apply context-aware adjustments
+        self.apply_context_adjustments(&mut result, content, context);
+
+        result
+    }
+
+    /// Apply context-aware adjustments to scan result.
+    fn apply_context_adjustments(
+        &self,
+        result: &mut WebshellScanResult,
+        content: &str,
+        context: &ScanContext,
+    ) {
+        // Rule 1: Minified code with only obfuscation triggers -> downgrade to Clean
+        let is_minified = context.is_minified || is_likely_minified(content);
+        if is_minified {
+            let only_obfuscation = result.detections.iter().all(|d| {
+                d.category == DetectionCategory::Obfuscation
+                    || d.category == DetectionCategory::SuspiciousFunction
+            }) && !result.detections.iter().any(|d| {
+                d.category == DetectionCategory::InputEvalChain
+                    || d.category == DetectionCategory::DecodeChain
+                    || d.category == DetectionCategory::KnownSignature
+                    || d.category == DetectionCategory::DynamicExecution
+            });
+
+            if only_obfuscation && result.threat_level != ThreatLevel::Clean {
+                result.threat_level = ThreatLevel::Clean;
+                result.is_malicious = false;
+            }
+        }
+
+        // Rule 2: Framework code with SuspiciousFunction (not InputEvalChain) -> reduced score
+        if let Some(framework) = &context.framework {
+            if framework.uses_eval_legitimately() {
+                // Remove SuspiciousFunction detections for eval/assert in known frameworks
+                // unless they're part of an InputEvalChain
+                let has_input_eval = result
+                    .detections
+                    .iter()
+                    .any(|d| d.category == DetectionCategory::InputEvalChain);
+
+                if !has_input_eval {
+                    // Apply score multiplier to reduce severity
+                    result.obfuscation_score =
+                        (result.obfuscation_score as f32 * context.score_multiplier) as u32;
+
+                    // If only SuspiciousFunction detections remain, downgrade
+                    let only_suspicious = result
+                        .detections
+                        .iter()
+                        .all(|d| d.category == DetectionCategory::SuspiciousFunction);
+
+                    if only_suspicious && result.threat_level == ThreatLevel::Suspicious {
+                        result.threat_level = ThreatLevel::Clean;
+                        result.is_malicious = false;
+                    }
+                }
+            }
+        }
+
+        // Rule 3: Vendor directory files require 2x obfuscation threshold
+        if context.is_vendor {
+            let effective_threshold = self.obfuscation_threshold * 2;
+            if result.obfuscation_score < effective_threshold {
+                // Don't trigger on obfuscation alone in vendor code
+                let only_obfuscation_based = !result.detections.iter().any(|d| {
+                    d.category == DetectionCategory::InputEvalChain
+                        || d.category == DetectionCategory::DecodeChain
+                        || d.category == DetectionCategory::KnownSignature
+                        || d.category == DetectionCategory::DynamicExecution
+                });
+
+                if only_obfuscation_based && result.threat_level == ThreatLevel::Suspicious {
+                    result.threat_level = ThreatLevel::Clean;
+                    result.is_malicious = false;
+                }
+            }
+        }
+
+        // Rule 4: Cache directories - very high threshold
+        if context.is_cache {
+            // Apply aggressive multiplier for cache files
+            result.obfuscation_score =
+                (result.obfuscation_score as f32 * 0.3) as u32;
+
+            // Only alert on definitive indicators in cache
+            let has_definitive = result.detections.iter().any(|d| {
+                d.category == DetectionCategory::InputEvalChain
+                    || d.category == DetectionCategory::KnownSignature
+            });
+
+            if !has_definitive {
+                result.threat_level = ThreatLevel::Clean;
+                result.is_malicious = false;
+            }
+        }
+
+        // Recalculate is_malicious based on adjusted threat level
+        result.is_malicious = result.threat_level == ThreatLevel::Malicious
+            || (result.threat_level == ThreatLevel::Suspicious
+                && result.obfuscation_score >= self.obfuscation_threshold);
     }
 
     /// Scan JSP content for webshells.
@@ -1112,5 +1346,132 @@ mod tests {
         assert_eq!(WebshellScanner::should_scan_language(Path::new("test.aspx")), Some(WebshellLanguage::AspNet));
         assert_eq!(WebshellScanner::should_scan_language(Path::new("test.py")), Some(WebshellLanguage::Python));
         assert_eq!(WebshellScanner::should_scan_language(Path::new("test.txt")), None);
+    }
+
+    // Context-aware scanning tests
+    #[test]
+    fn test_is_likely_minified() {
+        // Short normal code - not minified
+        let normal = r#"<?php
+function hello() {
+    echo "Hello World";
+}
+?>"#;
+        assert!(!is_likely_minified(normal));
+
+        // Minified with sourceMappingURL
+        let with_source_map = r#"var a=1,b=2,c=3;function d(){return a+b}//# sourceMappingURL=app.js.map"#;
+        assert!(is_likely_minified(with_source_map));
+    }
+
+    #[test]
+    fn test_scan_context_from_path() {
+        let vendor_path = Path::new("/var/www/html/vendor/monolog/monolog/src/Logger.php");
+        let context = ScanContext::from_path(vendor_path);
+        assert!(context.is_vendor);
+        assert!(context.score_multiplier < 1.0);
+
+        let normal_path = Path::new("/var/www/html/app/Controller.php");
+        let context = ScanContext::from_path(normal_path);
+        assert!(!context.is_vendor);
+        assert_eq!(context.score_multiplier, 1.0);
+    }
+
+    #[test]
+    fn test_vendor_directory_higher_threshold() {
+        let s = scanner();
+
+        // Code with eval that would normally trigger as suspicious
+        let code = r#"<?php eval('echo 1;'); ?>"#;
+
+        // Normal scan - should trigger
+        let result = s.scan(code);
+        // eval() triggers SuspiciousFunction
+
+        // Vendor context - should be more lenient
+        let context = ScanContext {
+            is_vendor: true,
+            score_multiplier: 0.5,
+            ..Default::default()
+        };
+        let result_with_context = s.scan_with_context(code, &context);
+
+        // Vendor scan should be less severe (no InputEvalChain, so downgraded)
+        assert!(result_with_context.threat_level == ThreatLevel::Clean ||
+                result_with_context.threat_level == ThreatLevel::Suspicious);
+    }
+
+    #[test]
+    fn test_framework_context_eval() {
+        let s = scanner();
+
+        // eval without user input (common in WordPress)
+        let code = r#"<?php eval($cached_code); ?>"#;
+
+        // With WordPress framework context
+        let context = ScanContext {
+            framework: Some(Framework::WordPress),
+            score_multiplier: 0.5,
+            ..Default::default()
+        };
+
+        let result = s.scan_with_context(code, &context);
+
+        // Should be lenient since WordPress uses eval legitimately
+        // and there's no user input chain
+        assert!(!result.is_malicious || result.threat_level != ThreatLevel::Malicious);
+    }
+
+    #[test]
+    fn test_cache_directory_high_threshold() {
+        let s = scanner();
+
+        // Code with eval but without user input - in cache should be suppressed
+        let code = r#"<?php eval($cached_code); ?>"#;
+
+        // With cache context
+        let context = ScanContext {
+            is_cache: true,
+            score_multiplier: 0.3,
+            ..Default::default()
+        };
+
+        let result = s.scan_with_context(code, &context);
+
+        // Cache directories have very high thresholds - only definitive indicators
+        // (InputEvalChain or KnownSignature) should trigger alerts
+        // SuspiciousFunction alone should not trigger in cache
+        assert!(!result.is_malicious || result.threat_level != ThreatLevel::Malicious);
+
+        // However, a real webshell with user input should still be detected
+        let webshell_code = r#"<?php eval($_POST['cmd']); ?>"#;
+        let webshell_result = s.scan_with_context(webshell_code, &context);
+
+        // InputEvalChain is definitive - should be detected even in cache
+        assert!(webshell_result.is_malicious);
+        assert!(webshell_result
+            .detections
+            .iter()
+            .any(|d| d.category == DetectionCategory::InputEvalChain));
+    }
+
+    #[test]
+    fn test_real_webshell_still_detected_in_vendor() {
+        let s = scanner();
+
+        // Real webshell with user input - should always be detected
+        let code = r#"<?php eval($_POST['cmd']); ?>"#;
+
+        let context = ScanContext {
+            is_vendor: true,
+            score_multiplier: 0.5,
+            ..Default::default()
+        };
+
+        let result = s.scan_with_context(code, &context);
+
+        // Should still be detected as malicious (InputEvalChain is definitive)
+        assert!(result.is_malicious);
+        assert_eq!(result.threat_level, ThreatLevel::Malicious);
     }
 }

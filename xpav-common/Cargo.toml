@@ -1,0 +1,16 @@
+[package]
+name = "xpav-common"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition = "2021"
+description = "Shared types for xpav eBPF programs and userspace"
+
+[features]
+default = []
+# Enable for userspace code (adds aya::Pod implementation)
+user = ["aya"]
+
+[dependencies]
+# Only needed for userspace Pod impl
+aya = { workspace = true, optional = true }

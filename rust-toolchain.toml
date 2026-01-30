@@ -1,0 +1,9 @@
+# Rust toolchain configuration for xpav
+#
+# Nightly is required for:
+# - Edition 2024 (used by xpav main crate)
+# - -Z build-std=core (used to build xpav-ebpf for BPF target)
+
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools"]

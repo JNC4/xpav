@@ -5,11 +5,13 @@ pub mod actions;
 pub use actions::{ActionResult, ResponseAction, ResponseActions};
 
 use crate::config::{LogFormat, RateLimitConfig};
-use crate::detection::{DetectionEvent, Severity};
+use crate::detection::{DetectionEvent, DetectionSource, Severity};
 use crate::metrics::{DETECTIONS_TOTAL, EVENTS_PROCESSED, WEBHOOK_FAILURES, WEBHOOK_SUCCESS};
 use crate::state::dedup::{DedupKey, EventDeduplicator};
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn as tracing_warn};
 
 #[cfg(feature = "webhooks")]
 use tracing::{error, warn};
@@ -57,12 +59,55 @@ impl RateLimiter {
     }
 
     /// Create a deduplication key for an event.
+    ///
+    /// Keys are designed for better deduplication:
+    /// - File detections: use path (not hash) - same file = same threat
+    /// - Process spawns: use `parent_name>child_name` (not PIDs) - same spawn pattern = same threat
+    /// - Execution: use exe path (not PID) - same executable = same threat
+    /// - Network: use remote addr:port (existing behavior)
     fn make_key(&self, event: &DetectionEvent) -> DedupKey {
-        // Key is based on: source, threat_type, and relevant identifier
-        let identifier = event.process.as_ref()
-            .map(|p| p.pid.to_string())
-            .or_else(|| event.file.as_ref().map(|f| f.path.display().to_string()))
-            .or_else(|| event.connection.as_ref().map(|c| format!("{}:{}", c.remote_addr, c.remote_port)));
+        // Build identifier based on event type for better deduplication
+        let identifier = if let Some(ref file) = event.file {
+            // File detections: use path for dedup (same file = same threat)
+            Some(file.path.display().to_string())
+        } else if let Some(ref proc) = event.process {
+            // Process detections: build key based on threat type
+            match event.threat_type {
+                // For shell spawns from web servers, use parent>child pattern
+                crate::detection::ThreatType::WebServerShellSpawn
+                | crate::detection::ThreatType::WebServerSuspiciousChild => {
+                    // Get parent name from ancestors if available
+                    let parent_name = proc
+                        .ancestors
+                        .first()
+                        .map(|a| a.name.clone())
+                        .unwrap_or_else(|| format!("ppid:{}", proc.ppid));
+                    Some(format!("{}>{}", parent_name, proc.name))
+                }
+                // For suspicious execution (from /tmp etc), use exe path
+                crate::detection::ThreatType::SuspiciousExecution => {
+                    proc.exe_path
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .or_else(|| Some(proc.name.clone()))
+                }
+                // For cryptominers, use name + pattern match (same miner = same threat)
+                crate::detection::ThreatType::Cryptominer => {
+                    Some(format!("miner:{}", proc.name))
+                }
+                // For other process detections, use exe path if available
+                _ => proc
+                    .exe_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .or_else(|| Some(format!("{}:{}", proc.name, proc.pid))),
+            }
+        } else if let Some(ref conn) = event.connection {
+            // Network detections: use remote endpoint
+            Some(format!("{}:{}", conn.remote_addr, conn.remote_port))
+        } else {
+            None
+        };
 
         DedupKey::from_event(
             &format!("{:?}", event.source),
@@ -83,12 +128,105 @@ impl Default for RateLimiter {
     }
 }
 
+/// Burst detector for identifying event floods.
+///
+/// When too many events from the same source occur within a time window,
+/// this indicates either:
+/// 1. A false positive pattern (legitimate activity triggering many alerts)
+/// 2. An actual attack (but individual alerts are less useful than aggregate)
+pub struct BurstDetector {
+    /// Event timestamps per detection source
+    counters: HashMap<DetectionSource, VecDeque<Instant>>,
+    /// Threshold: (count, window duration)
+    threshold: (usize, Duration),
+    /// Sources currently in burst mode
+    burst_sources: HashMap<DetectionSource, Instant>,
+}
+
+impl BurstDetector {
+    /// Create a new burst detector.
+    ///
+    /// - `threshold_count`: Number of events to trigger burst mode
+    /// - `window_seconds`: Time window for counting events
+    pub fn new(threshold_count: usize, window_seconds: u64) -> Self {
+        Self {
+            counters: HashMap::new(),
+            threshold: (threshold_count, Duration::from_secs(window_seconds)),
+            burst_sources: HashMap::new(),
+        }
+    }
+
+    /// Record an event and check if we're in burst mode.
+    ///
+    /// Returns `true` if the source is currently experiencing a burst.
+    pub fn record_and_check_burst(&mut self, source: DetectionSource) -> bool {
+        let now = Instant::now();
+
+        // Clean up expired burst states
+        self.burst_sources
+            .retain(|_, start| now.duration_since(*start) < self.threshold.1 * 2);
+
+        // If already in burst mode for this source, stay in it
+        if self.burst_sources.contains_key(&source) {
+            return true;
+        }
+
+        // Get or create counter for this source
+        let counter = self.counters.entry(source).or_insert_with(VecDeque::new);
+
+        // Remove old timestamps
+        let cutoff = now - self.threshold.1;
+        while counter.front().map(|t| *t < cutoff).unwrap_or(false) {
+            counter.pop_front();
+        }
+
+        // Add current event
+        counter.push_back(now);
+
+        // Check if we've hit the threshold
+        if counter.len() >= self.threshold.0 {
+            tracing_warn!(
+                source = ?source,
+                count = counter.len(),
+                window_secs = self.threshold.1.as_secs(),
+                "Burst detected - entering burst suppression mode"
+            );
+            self.burst_sources.insert(source, now);
+            counter.clear(); // Reset counter
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if a source is currently in burst mode without recording.
+    pub fn is_in_burst(&self, source: &DetectionSource) -> bool {
+        if let Some(start) = self.burst_sources.get(source) {
+            Instant::now().duration_since(*start) < self.threshold.1 * 2
+        } else {
+            false
+        }
+    }
+
+    /// Get the number of sources currently in burst mode.
+    pub fn burst_count(&self) -> usize {
+        self.burst_sources.len()
+    }
+}
+
+impl Default for BurstDetector {
+    fn default() -> Self {
+        Self::new(50, 60) // 50 events in 60 seconds
+    }
+}
+
 pub struct ResponseHandler {
     log_format: LogFormat,
     webhook_url: Option<String>,
     #[allow(dead_code)]
     dry_run: bool,
     rate_limiter: RateLimiter,
+    burst_detector: std::sync::Mutex<BurstDetector>,
     #[cfg(feature = "webhooks")]
     http_client: reqwest::Client,
 }
@@ -106,6 +244,25 @@ impl ResponseHandler {
         dry_run: bool,
         rate_limit_config: RateLimitConfig,
     ) -> Self {
+        Self::with_burst_detection(
+            log_format,
+            webhook_url,
+            dry_run,
+            rate_limit_config,
+            50, // default burst threshold
+            60, // default burst window
+        )
+    }
+
+    /// Create a new response handler with custom rate limiting and burst detection.
+    pub fn with_burst_detection(
+        log_format: LogFormat,
+        webhook_url: Option<String>,
+        dry_run: bool,
+        rate_limit_config: RateLimitConfig,
+        burst_threshold: usize,
+        burst_window_seconds: u64,
+    ) -> Self {
         #[cfg(feature = "webhooks")]
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -117,6 +274,10 @@ impl ResponseHandler {
             webhook_url,
             dry_run,
             rate_limiter: RateLimiter::new(rate_limit_config),
+            burst_detector: std::sync::Mutex::new(BurstDetector::new(
+                burst_threshold,
+                burst_window_seconds,
+            )),
             #[cfg(feature = "webhooks")]
             http_client,
         }
@@ -132,9 +293,29 @@ impl ResponseHandler {
     async fn handle_event(&self, event: &DetectionEvent) {
         EVENTS_PROCESSED.inc();
 
+        // Check burst detection first
+        let in_burst = {
+            if let Ok(mut detector) = self.burst_detector.lock() {
+                detector.record_and_check_burst(event.source)
+            } else {
+                false
+            }
+        };
+
+        if in_burst {
+            debug!(
+                "Event suppressed due to burst: {:?} from {:?}",
+                event.threat_type, event.source
+            );
+            return;
+        }
+
         // Check rate limiting
         if !self.rate_limiter.should_report(event) {
-            debug!("Event rate limited: {:?} from {:?}", event.threat_type, event.source);
+            debug!(
+                "Event rate limited: {:?} from {:?}",
+                event.threat_type, event.source
+            );
             return;
         }
 

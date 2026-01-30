@@ -1,0 +1,16 @@
+[package]
+name = "xpav-ebpf"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition = "2021"
+description = "eBPF programs for xpav process monitoring"
+
+[dependencies]
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+xpav-common = { path = "../xpav-common" }
+
+[[bin]]
+name = "xpav-ebpf"
+path = "src/main.rs"

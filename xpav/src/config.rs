@@ -106,6 +106,8 @@ pub struct Config {
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
     #[serde(default)]
+    pub false_positive_reduction: FalsePositiveReductionConfig,
+    #[serde(default)]
     pub process_monitor: ProcessMonitorConfig,
     #[serde(default)]
     pub network_monitor: NetworkMonitorConfig,
@@ -125,6 +127,62 @@ pub struct Config {
     pub yara: YaraConfig,
     #[serde(default)]
     pub correlation: CorrelationConfig,
+}
+
+/// Configuration for false positive reduction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FalsePositiveReductionConfig {
+    /// Enable context-aware scoring
+    #[serde(default = "default_true")]
+    pub context_scoring: bool,
+    /// Auto-detect frameworks (WordPress, Laravel, Symfony, etc.)
+    #[serde(default = "default_true")]
+    pub auto_framework_detection: bool,
+    /// Score multiplier for vendor directory files (0.0-1.0)
+    #[serde(default = "default_vendor_multiplier")]
+    pub vendor_dir_multiplier: f32,
+    /// Trust minified/bundled code (reduce obfuscation scores)
+    #[serde(default = "default_true")]
+    pub trust_minified: bool,
+    /// Cache directory score multiplier
+    #[serde(default = "default_cache_multiplier")]
+    pub cache_dir_multiplier: f32,
+    /// Burst detection threshold (events within window)
+    #[serde(default = "default_burst_threshold")]
+    pub burst_threshold: usize,
+    /// Burst detection window in seconds
+    #[serde(default = "default_burst_window")]
+    pub burst_window_seconds: u64,
+}
+
+fn default_vendor_multiplier() -> f32 {
+    0.5
+}
+
+fn default_cache_multiplier() -> f32 {
+    0.3
+}
+
+fn default_burst_threshold() -> usize {
+    50
+}
+
+fn default_burst_window() -> u64 {
+    60
+}
+
+impl Default for FalsePositiveReductionConfig {
+    fn default() -> Self {
+        Self {
+            context_scoring: true,
+            auto_framework_detection: true,
+            vendor_dir_multiplier: 0.5,
+            trust_minified: true,
+            cache_dir_multiplier: 0.3,
+            burst_threshold: 50,
+            burst_window_seconds: 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -607,6 +665,7 @@ impl Default for Config {
             general: GeneralConfig::default(),
             allowlists: AllowlistConfig::default(),
             rate_limit: RateLimitConfig::default(),
+            false_positive_reduction: FalsePositiveReductionConfig::default(),
             process_monitor: ProcessMonitorConfig::default(),
             network_monitor: NetworkMonitorConfig::default(),
             persistence_monitor: PersistenceMonitorConfig::default(),
