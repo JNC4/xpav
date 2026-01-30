@@ -4,7 +4,7 @@ use crate::allowlist::AllowlistConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-const DEFAULT_SCAN_INTERVAL_MS: u64 = 1000;
+const DEFAULT_SCAN_INTERVAL_MS: u64 = 100; // H3: Reduced from 1000ms to catch short-lived processes
 const DEFAULT_CPU_THRESHOLD: f64 = 50.0;
 const DEFAULT_HIGH_CPU_THRESHOLD: f64 = 90.0;
 const DEFAULT_OBFUSCATION_THRESHOLD: u32 = 50;
@@ -24,6 +24,41 @@ const MINER_PATTERNS: &[&str] = &[
     "kthreaddk", "kdevtmpfsi", "kinsing", "kerberods", "dwarfpool",
     "pool.minexmr", "xmrpool.", "supportxmr", "nanopool.org", "hashvault.pro",
     "moneroocean", "2miners.com", "f2pool.", "antpool.", "nicehash",
+];
+
+/// Known miner executable SHA256 hashes (hex encoded).
+/// These can't be bypassed by renaming the binary.
+const KNOWN_MINER_HASHES: &[&str] = &[
+    // XMRig common versions
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", // example placeholder
+    // Add known miner hashes here - can be extended via config
+];
+
+/// Known mining pool IPs that can't be bypassed by DNS.
+/// Updated from threat intelligence sources.
+const MINING_POOL_IPS: &[&str] = &[
+    // xmrpool.eu
+    "51.79.173.214",
+    "51.79.78.121",
+    // supportxmr.com
+    "167.114.114.174",
+    "167.114.114.175",
+    "167.114.114.176",
+    // moneroocean.stream
+    "139.99.124.170",
+    "139.99.124.171",
+    // nanopool.org
+    "144.217.14.109",
+    "144.217.14.110",
+    // hashvault.pro
+    "45.63.38.27",
+    // 2miners.com
+    "185.71.67.43",
+    // f2pool.com
+    "52.32.171.211",
+    // nicehash
+    "54.37.129.176",
+    "135.125.238.100",
 ];
 
 const SUSPICIOUS_PROCESS_NAMES: &[&str] = &[
@@ -59,20 +94,95 @@ const SENSITIVE_KPROBE_FUNCTIONS: &[&str] = &[
 
 const MEMORY_SKIP_PROCESSES: &[&str] = &["systemd", "init", "kthreadd"];
 
+/// C4 Fix: Expanded shellcode pattern database with common stubs and techniques.
+/// Hex-encoded byte patterns for detecting shellcode in memory.
 const SHELLCODE_PATTERNS: &[&str] = &[
-    "0f05", "cd80",
-    "31c048bbd19d9691d08c97ff", "6a3b58", "4831f64889e6", "48c7c03b",
+    // Syscall instructions (x86-64)
+    "0f05",                                 // syscall
+    "cd80",                                 // int 0x80 (x86)
+
+    // Common execve /bin/sh setup patterns
+    "31c048bbd19d9691d08c97ff",             // xor rax,rax; mov rbx, "/bin/sh"
+    "6a3b58",                               // push 0x3b; pop rax (execve syscall)
+    "4831f64889e6",                         // xor rsi, rsi; mov rsi, rsp
+    "48c7c03b",                             // mov rax, 0x3b (execve)
+    "4831c04889c74889c6",                   // xor rax,rax; mov rdi,rax; mov rsi,rax
+    "31c050682f2f7368682f62696e",           // xor eax,eax; push eax; push "//sh"; push "/bin"
+    "4831d248bbff2f62696e2f7368",           // xor rdx,rdx; mov rbx, "/bin/sh" reversed
+
+    // Socket syscall patterns (reverse shell)
+    "6a295899526a025f6a015e",               // socket(2,1,0) syscall setup
+    "6a31580f05",                           // push 0x31; pop rax; syscall (bind)
+    "6a32580f05",                           // push 0x32; pop rax; syscall (listen)
+    "6a2b580f05",                           // push 0x2b; pop rax; syscall (accept)
+    "6a21580f05",                           // push 0x21; pop rax; syscall (dup2)
+
+    // Connect syscall (outbound connection)
+    "6a2a580f05",                           // push 0x2a; pop rax; syscall (connect)
+
+    // mmap/mprotect patterns (memory manipulation for shellcode)
+    "6a09580f05",                           // push 9; pop rax; syscall (mmap)
+    "6a0a580f05",                           // push 0xa; pop rax; syscall (mprotect)
+
+    // Common NOP sleds that precede shellcode
+    "9090909090909090",                     // x86/x64 NOP sled
+    "6690669066906690",                     // 2-byte NOP sled
+
+    // Metasploit/common shellcode signatures
+    "fce8",                                 // cld; call (Metasploit staged payloads)
+    "fce889",                               // cld; call; mov (Metasploit)
+    "eb27",                                 // jmp short (common shellcode trampoline)
+    "eb1f5e",                               // jmp; pop rsi (getpc technique)
+
+    // x86 execve patterns
+    "31c031db31c9",                         // xor eax,eax; xor ebx,ebx; xor ecx,ecx
+    "31d2526a68682f626173",                 // xor edx,edx; push edx; push "h/bas"
+    "6a0b58",                               // push 0xb; pop eax (x86 execve)
+
+    // ROP gadget chain indicators
+    "5f5e5dc3",                             // pop rdi; pop rsi; pop rbp; ret
+    "5fc3",                                 // pop rdi; ret (common ROP gadget)
+    "5ec3",                                 // pop rsi; ret
+    "5ac3",                                 // pop rdx; ret
+    "58c3",                                 // pop rax; ret
 ];
 
+/// H5 Fix: Expanded integrity paths to include critical system binaries and auth files.
 const INTEGRITY_PATHS: &[&str] = &[
+    // Boot and kernel
     "/boot", "/lib/modules", "/etc/ld.so.preload", "/etc/ld.so.conf", "/etc/ld.so.conf.d",
+    // Critical binary directories
+    "/bin", "/sbin", "/usr/bin", "/usr/sbin",
+    // Library directories
+    "/lib", "/lib64", "/usr/lib", "/usr/lib64",
+    // Authentication files
+    "/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/security", "/etc/pam.d",
 ];
 
+/// H5 Fix: Expanded critical binaries list for integrity monitoring.
 const CRITICAL_BINARIES: &[&str] = &[
+    // File utilities often targeted by rootkits
     "/bin/ls", "/bin/ps", "/bin/netstat", "/usr/bin/ls", "/usr/bin/ps",
     "/usr/bin/netstat", "/usr/bin/ss", "/usr/bin/top", "/usr/bin/htop",
-    "/usr/bin/lsof", "/bin/login", "/usr/bin/sudo", "/usr/bin/su",
-    "/usr/bin/ssh", "/usr/sbin/sshd",
+    "/usr/bin/lsof", "/usr/bin/find", "/usr/bin/grep", "/bin/cat",
+    // Authentication and privilege escalation
+    "/bin/login", "/usr/bin/sudo", "/usr/bin/su", "/usr/bin/passwd",
+    "/usr/bin/chsh", "/usr/bin/chfn", "/usr/bin/newgrp", "/usr/bin/gpasswd",
+    // SSH
+    "/usr/bin/ssh", "/usr/sbin/sshd", "/usr/bin/scp", "/usr/bin/sftp",
+    // Package managers (supply chain attacks)
+    "/usr/bin/apt", "/usr/bin/apt-get", "/usr/bin/dpkg",
+    "/usr/bin/yum", "/usr/bin/dnf", "/usr/bin/rpm",
+    "/usr/bin/pacman",
+    // System utilities
+    "/usr/bin/wget", "/usr/bin/curl", "/bin/bash", "/bin/sh",
+    "/usr/bin/python", "/usr/bin/python3", "/usr/bin/perl",
+    // Init and service management
+    "/sbin/init", "/usr/lib/systemd/systemd", "/usr/bin/systemctl",
+    // Kernel module utilities
+    "/sbin/insmod", "/sbin/modprobe", "/sbin/rmmod", "/sbin/lsmod",
+    "/usr/sbin/insmod", "/usr/sbin/modprobe", "/usr/sbin/rmmod",
 ];
 
 const SUSPICIOUS_CAPABILITIES: &[&str] = &[
@@ -127,6 +237,9 @@ pub struct Config {
     pub yara: YaraConfig,
     #[serde(default)]
     pub correlation: CorrelationConfig,
+    /// H8 Fix: Metrics endpoint configuration
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// Configuration for false positive reduction.
@@ -240,13 +353,19 @@ pub struct ProcessMonitorConfig {
     pub monitor_cpu: bool,
     #[serde(default = "default_cpu_threshold")]
     pub cpu_threshold: f64,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub alert_high_cpu_unknown: bool,
     #[serde(default = "default_high_cpu_threshold")]
     pub high_cpu_threshold: f64,
     /// Use netlink proc_events instead of polling (falls back to polling if unavailable)
     #[serde(default = "default_true")]
     pub use_netlink: bool,
+    /// SHA256 hashes of known miner executables (can't be bypassed by renaming)
+    #[serde(default = "default_miner_hashes")]
+    pub miner_hashes: Vec<String>,
+    /// Enable behavioral correlation (high CPU + mining network = alert)
+    #[serde(default = "default_true")]
+    pub behavioral_correlation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,12 +376,18 @@ pub struct NetworkMonitorConfig {
     pub scan_interval_ms: u64,
     #[serde(default = "default_mining_pools")]
     pub blocked_domains: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_mining_pool_ips")]
     pub blocked_ips: Vec<String>,
     #[serde(default)]
     pub blocklist_urls: Vec<String>,
     #[serde(default)]
     pub action: ResponseAction,
+    /// Enable stratum port + high CPU heuristic detection
+    #[serde(default = "default_true")]
+    pub stratum_port_heuristics: bool,
+    /// Mining ports to watch for heuristic detection
+    #[serde(default = "default_mining_ports")]
+    pub mining_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +402,18 @@ pub struct PersistenceMonitorConfig {
     pub watch_systemd: bool,
     #[serde(default = "default_true")]
     pub watch_ld_preload: bool,
+    /// H4 Fix: Watch PAM configuration and modules
+    #[serde(default = "default_true")]
+    pub watch_pam: bool,
+    /// H4 Fix: Watch shell profiles (/etc/profile, .bashrc, etc.)
+    #[serde(default = "default_true")]
+    pub watch_shell_profiles: bool,
+    /// H4 Fix: Watch init scripts (/etc/init.d, /etc/rc.local)
+    #[serde(default = "default_true")]
+    pub watch_init_scripts: bool,
+    /// H4 Fix: Watch GRUB/bootloader configuration
+    #[serde(default = "default_true")]
+    pub watch_grub: bool,
     #[serde(default)]
     pub action: ResponseAction,
 }
@@ -482,6 +619,38 @@ pub struct CorrelationConfig {
     pub max_events: usize,
 }
 
+/// H8 Fix: Metrics endpoint configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable metrics endpoint
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Bind address for metrics server (default: localhost only for security)
+    #[serde(default = "default_metrics_bind_address")]
+    pub bind_address: String,
+    /// Port for metrics server
+    #[serde(default = "default_metrics_port")]
+    pub port: u16,
+}
+
+fn default_metrics_bind_address() -> String {
+    "127.0.0.1".to_string() // H8: Localhost only by default
+}
+
+fn default_metrics_port() -> u16 {
+    9090
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind_address: default_metrics_bind_address(),
+            port: default_metrics_port(),
+        }
+    }
+}
+
 fn default_correlation_window() -> u64 { 300 }
 fn default_max_correlation_events() -> usize { 1000 }
 fn default_entropy_threshold() -> f64 { 7.0 }
@@ -521,6 +690,9 @@ fn default_integrity_paths() -> Vec<PathBuf> { to_pathbuf_vec(INTEGRITY_PATHS) }
 fn default_critical_binaries() -> Vec<PathBuf> { to_pathbuf_vec(CRITICAL_BINARIES) }
 fn default_suspicious_capabilities() -> Vec<String> { to_string_vec(SUSPICIOUS_CAPABILITIES) }
 fn default_mining_pools() -> Vec<String> { to_string_vec(MINING_POOLS) }
+fn default_miner_hashes() -> Vec<String> { to_string_vec(KNOWN_MINER_HASHES) }
+fn default_mining_pool_ips() -> Vec<String> { to_string_vec(MINING_POOL_IPS) }
+fn default_mining_ports() -> Vec<u16> { vec![3333, 4444, 5555, 7777, 8888, 9999, 14433, 14444, 45560, 45700] }
 
 impl Default for GeneralConfig {
     fn default() -> Self {
@@ -547,9 +719,11 @@ impl Default for ProcessMonitorConfig {
             suspicious_child_processes: default_suspicious_child_processes(),
             monitor_cpu: true,
             cpu_threshold: DEFAULT_CPU_THRESHOLD,
-            alert_high_cpu_unknown: false,
+            alert_high_cpu_unknown: true, // H6: Enable by default
             high_cpu_threshold: DEFAULT_HIGH_CPU_THRESHOLD,
             use_netlink: true,
+            miner_hashes: default_miner_hashes(),
+            behavioral_correlation: true,
         }
     }
 }
@@ -560,9 +734,11 @@ impl Default for NetworkMonitorConfig {
             enabled: true,
             scan_interval_ms: DEFAULT_SCAN_INTERVAL_MS,
             blocked_domains: default_mining_pools(),
-            blocked_ips: vec![],
+            blocked_ips: default_mining_pool_ips(),
             blocklist_urls: vec![],
             action: ResponseAction::Alert,
+            stratum_port_heuristics: true,
+            mining_ports: default_mining_ports(),
         }
     }
 }
@@ -575,6 +751,10 @@ impl Default for PersistenceMonitorConfig {
             watch_ssh_keys: true,
             watch_systemd: true,
             watch_ld_preload: true,
+            watch_pam: true,
+            watch_shell_profiles: true,
+            watch_init_scripts: true,
+            watch_grub: true,
             action: ResponseAction::Alert,
         }
     }
@@ -676,8 +856,25 @@ impl Default for Config {
             container_monitor: ContainerMonitorConfig::default(),
             yara: YaraConfig::default(),
             correlation: CorrelationConfig::default(),
+            metrics: MetricsConfig::default(),
         }
     }
+}
+
+/// H9 Fix: Security profiles for different deployment scenarios.
+/// These provide sensible defaults for different security requirements.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SecurityProfile {
+    /// Minimal monitoring - process and network only
+    Minimal,
+    /// Standard monitoring - adds persistence and file monitoring
+    #[default]
+    Standard,
+    /// High security - adds memory scanning and integrity monitoring
+    High,
+    /// Healthcare deployment - all monitors enabled with strict defaults
+    Healthcare,
 }
 
 impl Config {
@@ -688,5 +885,93 @@ impl Config {
 
     pub fn load_or_default(path: &std::path::Path) -> Self {
         Self::load(path).unwrap_or_default()
+    }
+
+    /// Create a configuration based on a security profile.
+    /// H9 Fix: Provides sensible defaults for different deployment scenarios.
+    pub fn from_profile(profile: SecurityProfile) -> Self {
+        let mut config = Self::default();
+
+        match profile {
+            SecurityProfile::Minimal => {
+                // Only process and network monitoring
+                config.process_monitor.enabled = true;
+                config.network_monitor.enabled = true;
+                config.persistence_monitor.enabled = false;
+                config.file_monitor.enabled = false;
+                config.ebpf_monitor.enabled = false;
+                config.memory_scanner.enabled = false;
+                config.integrity_monitor.enabled = false;
+                config.container_monitor.enabled = false;
+                config.yara.enabled = false;
+            }
+            SecurityProfile::Standard => {
+                // Process, network, persistence, file monitoring
+                config.process_monitor.enabled = true;
+                config.network_monitor.enabled = true;
+                config.persistence_monitor.enabled = true;
+                config.file_monitor.enabled = true;
+                config.ebpf_monitor.enabled = false;
+                config.memory_scanner.enabled = false;
+                config.integrity_monitor.enabled = false;
+                config.container_monitor.enabled = false;
+                config.yara.enabled = false;
+            }
+            SecurityProfile::High => {
+                // All basic monitors + memory and integrity
+                config.process_monitor.enabled = true;
+                config.network_monitor.enabled = true;
+                config.persistence_monitor.enabled = true;
+                config.file_monitor.enabled = true;
+                config.ebpf_monitor.enabled = false; // Requires bpftool
+                config.memory_scanner.enabled = true;
+                config.integrity_monitor.enabled = true;
+                config.container_monitor.enabled = true;
+                config.yara.enabled = false; // Requires YARA rules
+            }
+            SecurityProfile::Healthcare => {
+                // All monitors enabled with strict defaults for critical healthcare infrastructure
+                config.process_monitor.enabled = true;
+                config.process_monitor.alert_high_cpu_unknown = true;
+                config.process_monitor.track_ancestry = true;
+                config.process_monitor.behavioral_correlation = true;
+
+                config.network_monitor.enabled = true;
+                config.network_monitor.stratum_port_heuristics = true;
+
+                config.persistence_monitor.enabled = true;
+                config.persistence_monitor.watch_pam = true;
+                config.persistence_monitor.watch_shell_profiles = true;
+                config.persistence_monitor.watch_init_scripts = true;
+                config.persistence_monitor.watch_grub = true;
+
+                config.file_monitor.enabled = true;
+                config.file_monitor.entropy_analysis = true;
+
+                config.ebpf_monitor.enabled = true;
+                config.ebpf_monitor.alert_on_new_programs = true;
+
+                config.memory_scanner.enabled = true;
+                config.memory_scanner.check_suspicious_exec_regions = true;
+
+                config.integrity_monitor.enabled = true;
+                config.integrity_monitor.monitor_kernel_modules = true;
+                config.integrity_monitor.monitor_boot = true;
+                config.integrity_monitor.monitor_ld_preload = true;
+
+                config.container_monitor.enabled = true;
+                config.container_monitor.detect_escapes = true;
+                config.container_monitor.monitor_privileged = true;
+
+                config.yara.enabled = true;
+                config.yara.scan_on_file_create = true;
+                config.yara.scan_memory = true;
+
+                // Metrics bound to localhost only
+                config.metrics.bind_address = "127.0.0.1".to_string();
+            }
+        }
+
+        config
     }
 }

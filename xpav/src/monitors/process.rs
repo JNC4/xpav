@@ -7,9 +7,11 @@ use crate::detection::{
 };
 use crate::util::parse_status_field;
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -33,6 +35,12 @@ pub struct ProcessMonitor {
     reported_high_cpu: HashSet<u32>,
     clock_ticks_per_sec: u64,
     allowlist: Arc<AllowlistChecker>,
+    /// SHA256 hashes of known miner executables (lowercase hex)
+    miner_hashes: HashSet<String>,
+    /// Cache of already hashed executables (path -> hash)
+    exe_hash_cache: HashMap<PathBuf, String>,
+    /// PIDs already reported for miner hash detection
+    reported_miner_hash: HashSet<u32>,
 }
 
 impl ProcessMonitor {
@@ -65,6 +73,13 @@ impl ProcessMonitor {
 
         let clock_ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 };
 
+        // Build hash set of known miner hashes (lowercase)
+        let miner_hashes: HashSet<String> = config
+            .miner_hashes
+            .iter()
+            .map(|h| h.to_lowercase())
+            .collect();
+
         Self {
             config,
             event_tx,
@@ -76,7 +91,58 @@ impl ProcessMonitor {
             reported_high_cpu: HashSet::new(),
             clock_ticks_per_sec,
             allowlist,
+            miner_hashes,
+            exe_hash_cache: HashMap::new(),
+            reported_miner_hash: HashSet::new(),
         }
+    }
+
+    /// Compute SHA256 hash of an executable file.
+    /// Returns None if file can't be read (e.g., deleted, permission denied).
+    fn hash_executable(path: &Path) -> Option<String> {
+        // Limit file size to avoid DoS (100MB max)
+        const MAX_SIZE: u64 = 100 * 1024 * 1024;
+
+        let metadata = fs::metadata(path).ok()?;
+        if metadata.len() > MAX_SIZE {
+            return None;
+        }
+
+        let mut file = fs::File::open(path).ok()?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buffer[..n]),
+                Err(_) => return None,
+            }
+        }
+
+        Some(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Get hash for an executable, using cache if available.
+    fn get_exe_hash(&mut self, path: &Path) -> Option<String> {
+        if let Some(hash) = self.exe_hash_cache.get(path) {
+            return Some(hash.clone());
+        }
+
+        if let Some(hash) = Self::hash_executable(path) {
+            self.exe_hash_cache.insert(path.to_path_buf(), hash.clone());
+            return Some(hash);
+        }
+
+        None
+    }
+
+    /// Check if an executable matches a known miner hash.
+    fn is_known_miner_hash(&mut self, exe_path: &Path) -> bool {
+        if let Some(hash) = self.get_exe_hash(exe_path) {
+            return self.miner_hashes.contains(&hash);
+        }
+        false
     }
 
     /// Run the process monitor.
@@ -162,6 +228,12 @@ impl ProcessMonitor {
         }
 
         self.reported_high_cpu.retain(|pid| current_pids.contains(pid));
+        self.reported_miner_hash.retain(|pid| current_pids.contains(pid));
+
+        // Limit exe hash cache size to avoid memory growth
+        if self.exe_hash_cache.len() > 10000 {
+            self.exe_hash_cache.clear();
+        }
 
         self.known_pids = current_pids;
 
@@ -416,48 +488,82 @@ impl ProcessMonitor {
         let miner_pattern = self.check_miner_patterns(&proc_with_ancestry)
             .or_else(|| self.check_suspicious_env(proc.pid));
 
-        // Check 1: Miner patterns in cmdline/env (with or without high CPU)
-        if let Some(ref pattern) = miner_pattern {
-            let (severity, desc) = if let Some(cpu) = cpu_usage {
-                if cpu >= self.config.cpu_threshold {
-                    (
-                        Severity::Critical,
+        // C1 Fix: Check executable hash against known miner hashes
+        // This can't be bypassed by renaming the binary
+        let mut detected_by_hash = false;
+        if !self.miner_hashes.is_empty() && !self.reported_miner_hash.contains(&proc.pid) {
+            if let Some(ref exe_path) = proc.exe_path {
+                if self.is_known_miner_hash(exe_path) {
+                    detected_by_hash = true;
+                    self.reported_miner_hash.insert(proc.pid);
+
+                    let severity = if cpu_usage.map(|c| c > 50.0).unwrap_or(false) {
+                        Severity::Critical
+                    } else {
+                        Severity::High
+                    };
+
+                    self.report_detection(
+                        ThreatType::Cryptominer,
+                        severity,
                         format!(
-                            "Cryptominer detected: process {} (PID {}) matches pattern '{}' with {:.1}% CPU",
-                            proc_with_ancestry.name, proc_with_ancestry.pid, pattern, cpu
+                            "Cryptominer detected by executable hash: process {} (PID {}) at {} (renamed binary bypass defeated)",
+                            proc_with_ancestry.name,
+                            proc_with_ancestry.pid,
+                            exe_path.display()
                         ),
+                        "exe_hash_match",
+                        &proc_with_ancestry,
                     )
+                    .await;
+                }
+            }
+        }
+
+        // Check 1: Miner patterns in cmdline/env (with or without high CPU)
+        if !detected_by_hash {
+            if let Some(ref pattern) = miner_pattern {
+                let (severity, desc) = if let Some(cpu) = cpu_usage {
+                    if cpu >= self.config.cpu_threshold {
+                        (
+                            Severity::Critical,
+                            format!(
+                                "Cryptominer detected: process {} (PID {}) matches pattern '{}' with {:.1}% CPU",
+                                proc_with_ancestry.name, proc_with_ancestry.pid, pattern, cpu
+                            ),
+                        )
+                    } else {
+                        (
+                            Severity::High,
+                            format!(
+                                "Cryptominer detected: process {} (PID {}) matches pattern '{}' (CPU: {:.1}%)",
+                                proc_with_ancestry.name, proc_with_ancestry.pid, pattern, cpu
+                            ),
+                        )
+                    }
                 } else {
                     (
                         Severity::High,
                         format!(
-                            "Cryptominer detected: process {} (PID {}) matches pattern '{}' (CPU: {:.1}%)",
-                            proc_with_ancestry.name, proc_with_ancestry.pid, pattern, cpu
+                            "Cryptominer detected: process {} (PID {}) matches pattern '{}'",
+                            proc_with_ancestry.name, proc_with_ancestry.pid, pattern
                         ),
                     )
-                }
-            } else {
-                (
-                    Severity::High,
-                    format!(
-                        "Cryptominer detected: process {} (PID {}) matches pattern '{}'",
-                        proc_with_ancestry.name, proc_with_ancestry.pid, pattern
-                    ),
-                )
-            };
+                };
 
-            self.report_detection(
-                ThreatType::Cryptominer,
-                severity,
-                desc,
-                pattern,
-                &proc_with_ancestry,
-            )
-            .await;
+                self.report_detection(
+                    ThreatType::Cryptominer,
+                    severity,
+                    desc,
+                    pattern,
+                    &proc_with_ancestry,
+                )
+                .await;
+            }
         }
 
         // Check 2: High CPU without miner pattern (potential unknown miner)
-        if miner_pattern.is_none() && self.config.alert_high_cpu_unknown {
+        if miner_pattern.is_none() && !detected_by_hash && self.config.alert_high_cpu_unknown {
             if let Some(cpu) = cpu_usage {
                 if cpu >= self.config.high_cpu_threshold && !self.reported_high_cpu.contains(&proc.pid) {
                     debug!(
@@ -830,5 +936,24 @@ mod tests {
         // Verify clock ticks is reasonable (typically 100 on Linux)
         assert!(monitor.clock_ticks_per_sec > 0);
         assert!(monitor.clock_ticks_per_sec <= 10000); // Sanity check
+    }
+
+    #[test]
+    fn test_exe_hash_computation() {
+        // Hash /usr/bin/ls or any existing binary
+        let test_paths = ["/bin/ls", "/usr/bin/ls", "/bin/cat", "/usr/bin/cat"];
+
+        for path in test_paths {
+            let path = std::path::Path::new(path);
+            if path.exists() {
+                let hash = ProcessMonitor::hash_executable(path);
+                assert!(hash.is_some(), "Should be able to hash {}", path.display());
+                let hash = hash.unwrap();
+                assert_eq!(hash.len(), 64, "SHA256 hex should be 64 chars");
+                assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+                return; // Test passed with at least one binary
+            }
+        }
+        // Skip test if no test binaries found
     }
 }

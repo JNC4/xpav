@@ -6,6 +6,8 @@
 //! - Quarantine: Move suspicious files to quarantine directory
 
 use anyhow::{Context, Result};
+use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
@@ -18,7 +20,13 @@ pub enum ResponseAction {
     /// Log only, take no action
     Alert,
     /// Kill the process
-    Kill { pid: u32 },
+    Kill {
+        pid: u32,
+        /// Expected exe path for TOCTOU protection
+        expected_exe: Option<PathBuf>,
+        /// Expected process start time for TOCTOU protection
+        expected_start_time: Option<u64>,
+    },
     /// Block an IP address
     BlockIp { ip: String, duration_secs: Option<u64> },
     /// Block a port
@@ -27,6 +35,33 @@ pub enum ResponseAction {
     Quarantine { path: PathBuf },
     /// Custom command
     Custom { command: String },
+}
+
+/// Validate that a string is a valid IP address (prevents command injection).
+fn validate_ip(ip: &str) -> Result<()> {
+    ip.parse::<IpAddr>()
+        .map_err(|_| anyhow::anyhow!("Invalid IP address format: {}", ip))?;
+    Ok(())
+}
+
+/// Get the start time (in clock ticks since boot) for a process from /proc/[pid]/stat.
+fn get_process_start_time(pid: u32) -> Option<u64> {
+    let stat_path = format!("/proc/{}/stat", pid);
+    let stat_content = fs::read_to_string(&stat_path).ok()?;
+
+    // /proc/[pid]/stat format has comm in parens which may contain spaces
+    // Find the last ')' to skip past the command name
+    let close_paren = stat_content.rfind(')')?;
+    let fields_str = &stat_content[close_paren + 2..]; // Skip ") "
+    let fields: Vec<&str> = fields_str.split_whitespace().collect();
+
+    // Field 22 (0-indexed as 19 after skipping pid, comm, state) is starttime
+    // After the closing paren: state(0), ppid(1), ..., starttime(19)
+    if fields.len() > 19 {
+        fields[19].parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Executor for response actions.
@@ -63,7 +98,9 @@ impl ResponseActions {
                 action: "alert".to_string(),
                 message: "Logged alert".to_string(),
             }),
-            ResponseAction::Kill { pid } => self.kill_process(*pid),
+            ResponseAction::Kill { pid, expected_exe, expected_start_time } => {
+                self.kill_process(*pid, expected_exe.as_deref(), *expected_start_time)
+            }
             ResponseAction::BlockIp { ip, duration_secs } => self.block_ip(ip, *duration_secs),
             ResponseAction::BlockPort { port, protocol } => self.block_port(*port, protocol),
             ResponseAction::Quarantine { path } => self.quarantine(path),
@@ -71,8 +108,17 @@ impl ResponseActions {
         }
     }
 
-    /// Kill a process by PID.
-    pub fn kill_process(&self, pid: u32) -> Result<ActionResult> {
+    /// Kill a process by PID with TOCTOU protection.
+    ///
+    /// Verifies process identity before kill to prevent PID recycling attacks:
+    /// - Checks that /proc/[pid]/exe matches expected executable
+    /// - Checks that process start time matches expected value
+    pub fn kill_process(
+        &self,
+        pid: u32,
+        expected_exe: Option<&Path>,
+        expected_start_time: Option<u64>,
+    ) -> Result<ActionResult> {
         info!("Kill action for PID {}", pid);
 
         if !self.execute {
@@ -80,6 +126,55 @@ impl ResponseActions {
                 action: "kill".to_string(),
                 would_do: format!("Would kill process {}", pid),
             });
+        }
+
+        // TOCTOU protection: Verify process identity before kill
+        // Check exe path matches if provided
+        if let Some(expected) = expected_exe {
+            let exe_path = format!("/proc/{}/exe", pid);
+            match fs::read_link(&exe_path) {
+                Ok(actual) => {
+                    if actual != expected {
+                        warn!(
+                            "PID {} exe mismatch: expected {:?}, got {:?}",
+                            pid, expected, actual
+                        );
+                        return Ok(ActionResult::Failed {
+                            action: "kill".to_string(),
+                            error: format!(
+                                "PID {} reused (exe mismatch), aborting kill for safety",
+                                pid
+                            ),
+                        });
+                    }
+                }
+                Err(_) => {
+                    // Process may have already exited
+                    return Ok(ActionResult::Failed {
+                        action: "kill".to_string(),
+                        error: format!("Process {} no longer exists", pid),
+                    });
+                }
+            }
+        }
+
+        // Check start time matches if provided
+        if let Some(expected_time) = expected_start_time {
+            if let Some(actual_time) = get_process_start_time(pid) {
+                if actual_time != expected_time {
+                    warn!(
+                        "PID {} start time mismatch: expected {}, got {}",
+                        pid, expected_time, actual_time
+                    );
+                    return Ok(ActionResult::Failed {
+                        action: "kill".to_string(),
+                        error: format!(
+                            "PID {} reused (start time mismatch), aborting kill for safety",
+                            pid
+                        ),
+                    });
+                }
+            }
         }
 
         // First try SIGTERM
@@ -96,11 +191,22 @@ impl ResponseActions {
                 // Check if process still exists
                 let proc_path = format!("/proc/{}", pid);
                 if Path::new(&proc_path).exists() {
-                    // Process still alive, try SIGKILL
-                    let _ = nix::sys::signal::kill(
-                        nix::unistd::Pid::from_raw(pid as i32),
-                        nix::sys::signal::Signal::SIGKILL,
-                    );
+                    // Re-verify identity before SIGKILL (another TOCTOU check)
+                    let should_kill = if let Some(expected) = expected_exe {
+                        fs::read_link(format!("/proc/{}/exe", pid))
+                            .map(|actual| actual == expected)
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    };
+
+                    if should_kill {
+                        // Process still alive, try SIGKILL
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid as i32),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                    }
                 }
 
                 Ok(ActionResult::Success {
@@ -116,7 +222,12 @@ impl ResponseActions {
     }
 
     /// Block an IP address using iptables or nftables.
+    ///
+    /// IP address is validated before use to prevent command injection.
     pub fn block_ip(&self, ip: &str, duration_secs: Option<u64>) -> Result<ActionResult> {
+        // Validate IP format to prevent command injection (C5 fix)
+        validate_ip(ip)?;
+
         info!("Block IP action for {}", ip);
 
         if !self.execute {
@@ -142,6 +253,8 @@ impl ResponseActions {
     }
 
     fn block_ip_iptables(&self, ip: &str, duration_secs: Option<u64>) -> Result<()> {
+        // IP is already validated by block_ip() caller
+
         // Check if rule already exists to avoid duplicates
         let check = Command::new("iptables")
             .args(["-C", "INPUT", "-s", ip, "-j", "DROP"])
@@ -166,12 +279,38 @@ impl ResponseActions {
         }
 
         // For iptables with duration, schedule removal using 'at' if available
+        // Write to a temp script file to avoid shell interpolation (C5 fix)
         if let Some(secs) = duration_secs {
-            let unblock_cmd = format!("iptables -D INPUT -s {} -j DROP", ip);
-            let _ = Command::new("sh")
-                .args(["-c", &format!("echo '{}' | at now + {} seconds 2>/dev/null", unblock_cmd, secs)])
-                .output();
-            // If 'at' is not available, log a warning but don't fail
+            // Create a temp script file with the unblock command
+            // This avoids shell interpolation of the IP address
+            let script_dir = "/var/run/xpav";
+            let _ = fs::create_dir_all(script_dir);
+
+            let script_path = format!("{}/unblock_{}.sh", script_dir, ip.replace(['.', ':'], "_"));
+            let script_content = format!(
+                "#!/bin/sh\niptables -D INPUT -s '{}' -j DROP\nrm -f '{}'\n",
+                ip, script_path
+            );
+
+            if fs::write(&script_path, &script_content).is_ok() {
+                // Make script executable
+                let _ = Command::new("chmod").args(["+x", &script_path]).output();
+
+                // Schedule script execution using 'at'
+                // Pass script path directly without shell interpolation
+                let _ = Command::new("at")
+                    .args([&format!("now + {} seconds", secs)])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .and_then(|mut child| {
+                        if let Some(stdin) = child.stdin.as_mut() {
+                            use std::io::Write;
+                            let _ = writeln!(stdin, "{}", script_path);
+                        }
+                        child.wait()
+                    });
+            }
+            // If 'at' or script creation fails, log a warning but don't fail
             // The rule will remain until manually removed
         }
 
@@ -426,8 +565,19 @@ mod tests {
     #[test]
     fn test_dry_run_kill() {
         let actions = ResponseActions::new(true); // dry run
-        let result = actions.kill_process(99999).unwrap();
+        let result = actions.kill_process(99999, None, None).unwrap();
         assert!(result.is_dry_run());
+    }
+
+    #[test]
+    fn test_ip_validation_rejects_injection() {
+        assert!(validate_ip("192.168.1.1").is_ok());
+        assert!(validate_ip("::1").is_ok());
+        assert!(validate_ip("2001:db8::1").is_ok());
+        assert!(validate_ip("192.168.1.1; rm -rf /").is_err());
+        assert!(validate_ip("$(whoami)").is_err());
+        assert!(validate_ip("192.168.1.1`id`").is_err());
+        assert!(validate_ip("not-an-ip").is_err());
     }
 
     #[test]

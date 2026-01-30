@@ -12,12 +12,13 @@ use crate::config::EbpfMonitorConfig;
 use crate::detection::{DetectionEvent, DetectionSource, Severity, ThreatType};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Information about a loaded eBPF program
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +64,11 @@ pub struct EbpfMonitor {
     baseline: Option<EbpfBaseline>,
     known_program_tags: HashSet<String>,
     sensitive_functions: HashSet<String>,
+    /// H1 Fix: Cached bpftool path and hash for integrity verification
+    bpftool_path: Option<PathBuf>,
+    bpftool_hash: Option<String>,
+    /// H1 Fix: Use native enumeration if bpftool unavailable
+    use_native_fallback: bool,
 }
 
 impl EbpfMonitor {
@@ -73,12 +79,150 @@ impl EbpfMonitor {
             .map(|s| s.to_lowercase())
             .collect();
 
+        // H1 Fix: Find and cache bpftool path with hash verification
+        let (bpftool_path, bpftool_hash) = Self::find_and_hash_bpftool();
+        let use_native_fallback = bpftool_path.is_none();
+
+        if use_native_fallback {
+            info!("bpftool not found, using native fallback enumeration");
+        }
+
         Self {
             config,
             event_tx,
             baseline: None,
             known_program_tags: HashSet::new(),
             sensitive_functions,
+            bpftool_path,
+            bpftool_hash,
+            use_native_fallback,
+        }
+    }
+
+    /// H1 Fix: Find bpftool and compute its hash for integrity verification.
+    fn find_and_hash_bpftool() -> (Option<PathBuf>, Option<String>) {
+        let paths = [
+            "/usr/sbin/bpftool",
+            "/sbin/bpftool",
+            "/usr/bin/bpftool",
+            "/bin/bpftool",
+            "/usr/local/sbin/bpftool",
+        ];
+
+        for path_str in paths {
+            let path = PathBuf::from(path_str);
+            if path.exists() {
+                // Compute SHA256 hash for integrity verification
+                if let Ok(content) = fs::read(&path) {
+                    let hash = format!("{:x}", Sha256::digest(&content));
+                    return (Some(path), Some(hash));
+                }
+                return (Some(path), None);
+            }
+        }
+
+        (None, None)
+    }
+
+    /// H1 Fix: Verify bpftool integrity before use.
+    fn verify_bpftool(&self) -> bool {
+        if let (Some(path), Some(expected_hash)) = (&self.bpftool_path, &self.bpftool_hash) {
+            if let Ok(content) = fs::read(path) {
+                let actual_hash = format!("{:x}", Sha256::digest(&content));
+                if &actual_hash != expected_hash {
+                    warn!(
+                        "bpftool integrity check failed! Expected {}, got {}",
+                        expected_hash, actual_hash
+                    );
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// H1 Fix: Native eBPF program enumeration via /sys/fs/bpf and /proc.
+    fn get_loaded_programs_native(&self) -> Result<Vec<EbpfProgram>> {
+        let mut programs = Vec::new();
+
+        // Parse /proc/*/fdinfo/* for BPF file descriptors
+        let proc_dir = fs::read_dir("/proc")?;
+
+        for entry in proc_dir.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if let Ok(pid) = name_str.parse::<u32>() {
+                let fdinfo_path = format!("/proc/{}/fdinfo", pid);
+                if let Ok(fdinfo_dir) = fs::read_dir(&fdinfo_path) {
+                    for fd_entry in fdinfo_dir.flatten() {
+                        if let Ok(content) = fs::read_to_string(fd_entry.path()) {
+                            // Look for BPF program file descriptors
+                            if content.contains("prog_type:") {
+                                if let Some(prog) = Self::parse_bpf_fdinfo(&content, pid) {
+                                    programs.push(prog);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also enumerate pinned BPF objects in /sys/fs/bpf
+        if let Ok(bpf_fs) = fs::read_dir("/sys/fs/bpf") {
+            for entry in bpf_fs.flatten() {
+                let path = entry.path();
+                // Pinned BPF programs appear as files in /sys/fs/bpf
+                if path.is_file() {
+                    programs.push(EbpfProgram {
+                        id: 0, // Can't get ID without bpftool
+                        prog_type: "unknown".to_string(),
+                        name: path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        tag: format!("pinned:{}", path.display()),
+                        loaded_at: None,
+                        pinned: vec![path.to_string_lossy().to_string()],
+                    });
+                }
+            }
+        }
+
+        Ok(programs)
+    }
+
+    /// Parse BPF program info from /proc/[pid]/fdinfo/[fd].
+    fn parse_bpf_fdinfo(content: &str, _pid: u32) -> Option<EbpfProgram> {
+        let mut prog_type = String::new();
+        let mut prog_id = 0u32;
+        let mut prog_tag = String::new();
+
+        for line in content.lines() {
+            if line.starts_with("prog_type:") {
+                prog_type = line.split_whitespace().nth(1)?.to_string();
+            } else if line.starts_with("prog_id:") {
+                prog_id = line.split_whitespace().nth(1)?.parse().ok()?;
+            } else if line.starts_with("prog_tag:") {
+                prog_tag = line.split_whitespace().nth(1)?.to_string();
+            }
+        }
+
+        if !prog_type.is_empty() {
+            Some(EbpfProgram {
+                id: prog_id,
+                prog_type,
+                name: String::new(),
+                tag: if prog_tag.is_empty() {
+                    format!("id:{}", prog_id)
+                } else {
+                    prog_tag
+                },
+                loaded_at: None,
+                pinned: vec![],
+            })
+        } else {
+            None
         }
     }
 
@@ -207,16 +351,33 @@ impl EbpfMonitor {
         Ok(())
     }
 
-    /// Get list of loaded eBPF programs via bpftool
+    /// Get list of loaded eBPF programs via bpftool or native fallback.
+    /// H1 Fix: Verifies bpftool integrity and falls back to native enumeration if needed.
     fn get_loaded_programs(&self) -> Result<Vec<EbpfProgram>> {
-        let output = Command::new("bpftool")
+        // H1 Fix: Use native fallback if bpftool unavailable
+        if self.use_native_fallback {
+            return self.get_loaded_programs_native();
+        }
+
+        // H1 Fix: Verify bpftool integrity before use
+        if !self.verify_bpftool() {
+            warn!("bpftool integrity verification failed, using native fallback");
+            return self.get_loaded_programs_native();
+        }
+
+        let bpftool_path = self.bpftool_path.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("bpftool path not set"))?;
+
+        let output = Command::new(bpftool_path)
             .args(["prog", "list", "--json"])
             .output()
             .context("Failed to run bpftool prog list")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("bpftool prog list failed: {}", stderr);
+            // Fall back to native enumeration on error
+            warn!("bpftool failed ({}), using native fallback", stderr.trim());
+            return self.get_loaded_programs_native();
         }
 
         let json: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)

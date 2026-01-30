@@ -31,6 +31,14 @@ struct WatchPaths {
     ssh: Vec<PathBuf>,
     systemd: Vec<PathBuf>,
     ld_preload: Vec<PathBuf>,
+    /// H4 Fix: PAM modules
+    pam: Vec<PathBuf>,
+    /// H4 Fix: Shell profiles
+    shell_profiles: Vec<PathBuf>,
+    /// H4 Fix: Init scripts
+    init_scripts: Vec<PathBuf>,
+    /// H4 Fix: GRUB/bootloader configs
+    grub: Vec<PathBuf>,
 }
 
 impl WatchPaths {
@@ -56,9 +64,45 @@ impl WatchPaths {
                 PathBuf::from("/usr/lib/systemd/system"),
             ],
             ld_preload: vec![PathBuf::from("/etc/ld.so.preload")],
+            // H4 Fix: PAM configuration
+            pam: vec![
+                PathBuf::from("/etc/pam.d"),
+                PathBuf::from("/lib/security"),
+                PathBuf::from("/lib64/security"),
+                PathBuf::from("/usr/lib/security"),
+                PathBuf::from("/usr/lib64/security"),
+            ],
+            // H4 Fix: Shell profiles
+            shell_profiles: vec![
+                PathBuf::from("/etc/profile"),
+                PathBuf::from("/etc/profile.d"),
+                PathBuf::from("/etc/bash.bashrc"),
+                PathBuf::from("/etc/bashrc"),
+                PathBuf::from("/etc/environment"),
+                PathBuf::from("/etc/zsh"),
+                // User profiles monitored via watch_home_shell_profiles()
+            ],
+            // H4 Fix: Init scripts
+            init_scripts: vec![
+                PathBuf::from("/etc/rc.local"),
+                PathBuf::from("/etc/init.d"),
+                PathBuf::from("/etc/rc0.d"),
+                PathBuf::from("/etc/rc1.d"),
+                PathBuf::from("/etc/rc2.d"),
+                PathBuf::from("/etc/rc3.d"),
+                PathBuf::from("/etc/rc4.d"),
+                PathBuf::from("/etc/rc5.d"),
+                PathBuf::from("/etc/rc6.d"),
+            ],
+            // H4 Fix: GRUB/bootloader configs
+            grub: vec![
+                PathBuf::from("/etc/default/grub"),
+                PathBuf::from("/boot/grub/grub.cfg"),
+                PathBuf::from("/boot/grub2/grub.cfg"),
+                PathBuf::from("/etc/grub.d"),
+            ],
         }
     }
-
 }
 
 impl PersistenceMonitor {
@@ -107,6 +151,11 @@ impl PersistenceMonitor {
             self.watch_home_ssh_dirs(&mut watcher);
         }
 
+        // H4 Fix: Watch shell profiles in home directories
+        if self.config.watch_shell_profiles {
+            self.watch_home_shell_profiles(&mut watcher);
+        }
+
         // Process events
         loop {
             match rx.recv() {
@@ -143,8 +192,50 @@ impl PersistenceMonitor {
         if self.config.watch_ld_preload {
             paths.extend(all_paths.ld_preload.into_iter());
         }
+        // H4 Fix: Add new persistence paths
+        if self.config.watch_pam {
+            paths.extend(all_paths.pam.into_iter());
+        }
+        if self.config.watch_shell_profiles {
+            paths.extend(all_paths.shell_profiles.into_iter());
+        }
+        if self.config.watch_init_scripts {
+            paths.extend(all_paths.init_scripts.into_iter());
+        }
+        if self.config.watch_grub {
+            paths.extend(all_paths.grub.into_iter());
+        }
 
         paths
+    }
+
+    /// H4 Fix: Watch shell profiles in user home directories
+    fn watch_home_shell_profiles(&self, watcher: &mut RecommendedWatcher) {
+        let profile_files = [".bashrc", ".bash_profile", ".profile", ".zshrc", ".zprofile"];
+
+        // Watch root's profiles
+        for file in &profile_files {
+            let path = PathBuf::from("/root").join(file);
+            if path.exists() {
+                if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                    debug!("Could not watch {}: {}", path.display(), e);
+                }
+            }
+        }
+
+        // Watch user home directories
+        if let Ok(entries) = fs::read_dir("/home") {
+            for entry in entries.flatten() {
+                for file in &profile_files {
+                    let path = entry.path().join(file);
+                    if path.exists() {
+                        if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
+                            debug!("Could not watch {}: {}", path.display(), e);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Watch SSH directories in all home directories
@@ -272,7 +363,7 @@ impl PersistenceMonitor {
             }
         }
 
-        if path_str.contains("systemd") && path_str.ends_with(".service") {
+        if path_str.contains("systemd") && (path_str.ends_with(".service") || path_str.ends_with(".timer")) {
             if self.config.watch_systemd {
                 return Some(ThreatType::SystemdModification);
             }
@@ -281,6 +372,56 @@ impl PersistenceMonitor {
         if path_str.contains("ld.so.preload") {
             if self.config.watch_ld_preload {
                 return Some(ThreatType::LdPreloadModification);
+            }
+        }
+
+        // H4 Fix: PAM configuration
+        if path_str.contains("/pam.d/") || path_str.contains("/security/") && path_str.ends_with(".so") {
+            if self.config.watch_pam {
+                return Some(ThreatType::PamModification);
+            }
+        }
+
+        // H4 Fix: Shell profiles
+        if path_str.contains("/etc/profile")
+            || path_str.contains("/etc/bash")
+            || path_str.contains("/etc/environment")
+            || path_str.contains("/etc/zsh")
+            || path_str.contains(".bashrc")
+            || path_str.contains(".bash_profile")
+            || path_str.contains(".profile")
+            || path_str.contains(".zshrc")
+            || path_str.contains(".zprofile")
+        {
+            if self.config.watch_shell_profiles {
+                return Some(ThreatType::ShellProfileModification);
+            }
+        }
+
+        // H4 Fix: Init scripts
+        if path_str.contains("/init.d/")
+            || path_str.contains("/rc.local")
+            || path_str.contains("/rc0.d/")
+            || path_str.contains("/rc1.d/")
+            || path_str.contains("/rc2.d/")
+            || path_str.contains("/rc3.d/")
+            || path_str.contains("/rc4.d/")
+            || path_str.contains("/rc5.d/")
+            || path_str.contains("/rc6.d/")
+        {
+            if self.config.watch_init_scripts {
+                return Some(ThreatType::InitScriptModification);
+            }
+        }
+
+        // H4 Fix: GRUB/bootloader
+        if path_str.contains("/grub/")
+            || path_str.contains("/grub2/")
+            || path_str.contains("/default/grub")
+            || path_str.contains("/grub.d/")
+        {
+            if self.config.watch_grub {
+                return Some(ThreatType::BootloaderModification);
             }
         }
 
@@ -349,6 +490,60 @@ impl PersistenceMonitor {
                 let severity = Severity::Critical;
                 let desc = format!(
                     "ld.so.preload {:?}: {} - potential library injection attack",
+                    event_type,
+                    path.display()
+                );
+                (severity, desc)
+            }
+
+            // H4 Fix: New threat types
+            ThreatType::PamModification => {
+                let severity = Severity::Critical;
+                let desc = format!(
+                    "PAM configuration {:?}: {} - potential authentication bypass",
+                    event_type,
+                    path.display()
+                );
+                (severity, desc)
+            }
+
+            ThreatType::ShellProfileModification => {
+                let content = fs::read_to_string(path).unwrap_or_default();
+                let suspicious = content.contains("curl")
+                    || content.contains("wget")
+                    || content.contains("base64")
+                    || content.contains("nc ")
+                    || content.contains("netcat")
+                    || content.contains("/dev/tcp");
+
+                let severity = if suspicious || path_str.contains("root") {
+                    Severity::High
+                } else {
+                    Severity::Medium
+                };
+                let desc = format!(
+                    "Shell profile {:?}: {}{}",
+                    event_type,
+                    path.display(),
+                    if suspicious { " (suspicious content)" } else { "" }
+                );
+                (severity, desc)
+            }
+
+            ThreatType::InitScriptModification => {
+                let severity = Severity::High;
+                let desc = format!(
+                    "Init script {:?}: {} - potential boot persistence",
+                    event_type,
+                    path.display()
+                );
+                (severity, desc)
+            }
+
+            ThreatType::BootloaderModification => {
+                let severity = Severity::Critical;
+                let desc = format!(
+                    "Bootloader config {:?}: {} - potential bootkits/rootkits",
                     event_type,
                     path.display()
                 );

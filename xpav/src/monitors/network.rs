@@ -20,6 +20,10 @@ pub struct NetworkMonitor {
     blocked_ips: HashSet<IpAddr>,
     reported_connections: HashSet<(u32, String, u16)>,
     scan_count: u32,
+    /// Mining ports to watch for heuristic detection
+    mining_ports: HashSet<u16>,
+    /// PIDs already reported for stratum heuristic
+    reported_stratum_heuristic: HashSet<u32>,
 }
 
 impl NetworkMonitor {
@@ -36,6 +40,8 @@ impl NetworkMonitor {
             .filter_map(|ip| ip.parse().ok())
             .collect();
 
+        let mining_ports: HashSet<u16> = config.mining_ports.iter().copied().collect();
+
         Self {
             config,
             event_tx,
@@ -43,7 +49,47 @@ impl NetworkMonitor {
             blocked_ips,
             reported_connections: HashSet::new(),
             scan_count: 0,
+            mining_ports,
+            reported_stratum_heuristic: HashSet::new(),
         }
+    }
+
+    /// Get CPU usage percentage for a process (reads /proc/[pid]/stat).
+    fn get_process_cpu(&self, pid: u32) -> Option<f64> {
+        // Read process stat
+        let stat_path = format!("/proc/{}/stat", pid);
+        let stat = fs::read_to_string(&stat_path).ok()?;
+
+        // Parse utime + stime (fields after closing paren)
+        let close_paren = stat.rfind(')')?;
+        let fields: Vec<&str> = stat[close_paren + 2..].split_whitespace().collect();
+        if fields.len() < 13 {
+            return None;
+        }
+
+        let utime: u64 = fields[11].parse().ok()?;
+        let stime: u64 = fields[12].parse().ok()?;
+        let total_ticks = utime + stime;
+
+        // Read uptime
+        let uptime = fs::read_to_string("/proc/uptime").ok()?;
+        let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+
+        // Read process start time
+        let starttime: u64 = fields[19].parse().ok()?;
+
+        // Clock ticks per second
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as f64 };
+
+        // Process running time in seconds
+        let process_uptime = uptime_secs - (starttime as f64 / hz);
+        if process_uptime <= 0.0 {
+            return None;
+        }
+
+        // CPU percentage
+        let cpu_secs = total_ticks as f64 / hz;
+        Some((cpu_secs / process_uptime) * 100.0)
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -101,10 +147,7 @@ impl NetworkMonitor {
             return;
         }
 
-        let is_mining_port = matches!(conn.remote_port,
-            3333 | 4444 | 5555 | 7777 | 8888 | 9999 | // Common mining ports
-            14433 | 14444 | 45560 | 45700 // SSL mining ports
-        );
+        let is_mining_port = self.mining_ports.contains(&conn.remote_port);
 
         let remote_ip: Option<IpAddr> = conn.remote_addr.parse().ok();
         let is_blocked_ip = remote_ip.is_some_and(|ip| self.blocked_ips.contains(&ip));
@@ -135,11 +178,12 @@ impl NetworkMonitor {
             .await;
             self.reported_connections.insert(conn_key);
         } else if is_blocked_ip {
+            // C2 Fix: Alert on connection to known mining pool IP (can't be bypassed by DNS)
             self.report_detection(
-                ThreatType::C2Connection,
-                Severity::High,
+                ThreatType::MiningPoolConnection,
+                Severity::Critical,
                 format!(
-                    "Connection to blocked IP: {}:{} from PID {:?}",
+                    "Connection to known mining pool IP: {}:{} from PID {:?}",
                     conn.remote_addr, conn.remote_port, conn.pid
                 ),
                 &conn.remote_addr,
@@ -148,7 +192,33 @@ impl NetworkMonitor {
             )
             .await;
             self.reported_connections.insert(conn_key);
-        } else if is_mining_port {
+        } else if is_mining_port && self.config.stratum_port_heuristics {
+            // C2 Fix: Stratum port + high CPU heuristic
+            // Check if process has high CPU usage
+            if let Some(pid) = conn.pid {
+                if !self.reported_stratum_heuristic.contains(&pid) {
+                    if let Some(cpu) = self.get_process_cpu(pid) {
+                        if cpu > 50.0 {
+                            // High CPU + mining port = suspicious mining behavior
+                            self.reported_stratum_heuristic.insert(pid);
+                            self.report_detection(
+                                ThreatType::SuspiciousMiningBehavior,
+                                Severity::High,
+                                format!(
+                                    "Suspicious mining behavior: PID {} connecting to stratum port {} with {:.1}% CPU ({}:{})",
+                                    pid, conn.remote_port, cpu, conn.remote_addr, conn.remote_port
+                                ),
+                                &format!("stratum_port={} cpu={:.1}%", conn.remote_port, cpu),
+                                conn,
+                                proc_info.as_ref(),
+                            )
+                            .await;
+                            self.reported_connections.insert(conn_key);
+                        }
+                    }
+                }
+            }
+
             debug!(
                 "Connection to potential mining port: {}:{} from PID {:?}",
                 conn.remote_addr, conn.remote_port, conn.pid

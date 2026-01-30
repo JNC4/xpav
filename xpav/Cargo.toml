@@ -57,6 +57,9 @@ walkdir = "2"
 # Hex encoding/decoding for shellcode patterns
 hex = "0.4"
 
+# SHA-256 hashing for executable verification
+sha2 = "0.10"
+
 # C library bindings for sysconf
 libc = "0.2"
 

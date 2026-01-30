@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Container runtime type
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +442,38 @@ impl ContainerMonitor {
             }
         }
 
+        // H2 Fix: Check /proc/[pid]/root symlink changes
+        // If a container process has / as its root, it may have escaped
+        if let Ok(root) = fs::read_link(format!("/proc/{}/root", pid)) {
+            let root_str = root.to_string_lossy();
+            // If we're in a container but process root is /, that's suspicious
+            if root_str == "/" {
+                if self.context.as_ref().is_some_and(|c| c.runtime != ContainerRuntime::None) {
+                    // Check if this is a known container process
+                    let cmdline = fs::read_to_string(format!("/proc/{}/cmdline", pid))
+                        .unwrap_or_default()
+                        .replace('\0', " ")
+                        .to_lowercase();
+
+                    // Skip container runtimes
+                    if !cmdline.contains("containerd")
+                        && !cmdline.contains("dockerd")
+                        && !cmdline.contains("runc")
+                        && !cmdline.contains("crio")
+                    {
+                        return Some(EscapeCandidate {
+                            pid,
+                            reason: format!(
+                                "Process has root filesystem access from inside container (root={})",
+                                root_str
+                            ),
+                            severity: Severity::Critical,
+                        });
+                    }
+                }
+            }
+        }
+
         // Check for suspicious capabilities
         if let Ok(caps) = self.get_capabilities(pid) {
             let suspicious: Vec<_> = caps
@@ -455,11 +487,14 @@ impl ContainerMonitor {
                     let cmdline = cmdline.replace('\0', " ");
                     let cmdline_lower = cmdline.to_lowercase();
 
-                    // Suspicious commands with dangerous caps
+                    // H2 Fix: Detect setns() syscall usage (nsenter binary or direct syscall)
+                    // Also detect additional escape techniques
                     if cmdline_lower.contains("nsenter")
                         || cmdline_lower.contains("unshare")
                         || cmdline_lower.contains("mount")
                         || cmdline_lower.contains("chroot")
+                        || cmdline_lower.contains("setns")  // H2: Direct setns usage
+                        || cmdline_lower.contains("pivot_root")  // H2: pivot_root escape
                     {
                         return Some(EscapeCandidate {
                             pid,
@@ -470,6 +505,75 @@ impl ContainerMonitor {
                             ),
                             severity: Severity::High,
                         });
+                    }
+                }
+            }
+        }
+
+        // H2 Fix: Check for cgroup escape (release_agent abuse)
+        if let Some(candidate) = self.check_cgroup_escape(pid) {
+            return Some(candidate);
+        }
+
+        None
+    }
+
+    /// H2 Fix: Check for cgroup escape via release_agent abuse.
+    /// This is a known container escape technique where an attacker:
+    /// 1. Finds a writable cgroup
+    /// 2. Enables notify_on_release
+    /// 3. Sets release_agent to a malicious script
+    /// 4. Creates and kills a process to trigger the agent
+    fn check_cgroup_escape(&self, pid: u32) -> Option<EscapeCandidate> {
+        // Check if process is writing to release_agent files
+        if let Ok(fd_dir) = fs::read_dir(format!("/proc/{}/fd", pid)) {
+            for fd in fd_dir.flatten() {
+                if let Ok(link) = fs::read_link(fd.path()) {
+                    let link_str = link.to_string_lossy();
+                    if link_str.contains("release_agent")
+                        || link_str.contains("notify_on_release")
+                    {
+                        return Some(EscapeCandidate {
+                            pid,
+                            reason: format!(
+                                "Process accessing cgroup escape vector: {}",
+                                link_str
+                            ),
+                            severity: Severity::Critical,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Check cgroup of the process for suspicious settings
+        let cgroup_path = format!("/proc/{}/cgroup", pid);
+        if let Ok(cgroup_content) = fs::read_to_string(&cgroup_path) {
+            for line in cgroup_content.lines() {
+                // Parse cgroup path
+                if let Some(path) = line.split(':').nth(2) {
+                    // Check various cgroup mount points for release_agent
+                    for base in ["/sys/fs/cgroup", "/sys/fs/cgroup/memory", "/sys/fs/cgroup/cpu"] {
+                        let release_agent_path = format!("{}{}/release_agent", base, path);
+                        if let Ok(agent) = fs::read_to_string(&release_agent_path) {
+                            let agent = agent.trim();
+                            if !agent.is_empty() {
+                                // release_agent is set - check if it points to suspicious location
+                                if agent.starts_with("/tmp")
+                                    || agent.starts_with("/dev/shm")
+                                    || agent.starts_with("/var/tmp")
+                                {
+                                    return Some(EscapeCandidate {
+                                        pid,
+                                        reason: format!(
+                                            "Cgroup release_agent set to suspicious path: {}",
+                                            agent
+                                        ),
+                                        severity: Severity::Critical,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }

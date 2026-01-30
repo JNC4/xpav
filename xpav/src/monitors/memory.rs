@@ -15,7 +15,7 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Information about a memory region
 #[derive(Debug, Clone)]
@@ -219,7 +219,11 @@ impl MemoryScanner {
                     continue;
                 }
 
-                let threat_type = if region.pathname.is_empty() {
+                let threat_type = if region.pathname.starts_with("/memfd:")
+                    || region.pathname.contains("memfd:")
+                {
+                    ThreatType::MemfdExecution
+                } else if region.pathname.is_empty() {
                     ThreatType::FilelessMalware
                 } else if region.pathname.contains("[stack]") || region.pathname.contains("[heap]") {
                     ThreatType::ProcessInjection
@@ -227,7 +231,9 @@ impl MemoryScanner {
                     ThreatType::SuspiciousMemoryRegion
                 };
 
-                let severity = if threat_type == ThreatType::FilelessMalware {
+                let severity = if threat_type == ThreatType::FilelessMalware
+                    || threat_type == ThreatType::MemfdExecution
+                {
                     Severity::Critical
                 } else if threat_type == ThreatType::ProcessInjection {
                     Severity::High
@@ -277,21 +283,26 @@ impl MemoryScanner {
 
     /// Determine if an executable region is suspicious
     fn is_suspicious_exec_region(&self, region: &MemoryRegion) -> bool {
+        // C3 Fix: Detect memfd: regions (fileless malware technique)
+        // memfd_create() creates anonymous memory-backed files that can be executed
+        if region.pathname.starts_with("/memfd:")
+            || region.pathname.contains("memfd:")
+        {
+            return true;
+        }
+
         // Anonymous executable memory (no file backing) is suspicious
         if region.pathname.is_empty() && region.inode == 0 {
-            // But only if it's also writable (rwx = classic injection)
+            // RWX (writable + executable) is always suspicious (classic injection)
             if region.permissions.contains('w') {
                 return true;
             }
-            // Or if it's just executable but not from a library
-            if !region.permissions.contains('w') {
-                // Could be JIT - check size
-                let size = region.end - region.start;
-                if size > 1024 * 1024 {
-                    // > 1MB anonymous exec is suspicious
-                    return true;
-                }
-            }
+
+            // C3 Fix: Remove size limit for anonymous exec regions
+            // Even small anonymous executable regions can contain shellcode
+            // JIT compilers typically use specific paths or have larger regions
+            // Any anonymous executable region without file backing is suspicious
+            return true;
         }
 
         // Executable heap or stack is always suspicious
@@ -359,6 +370,7 @@ impl MemoryScanner {
             }
 
             // Search for shellcode patterns
+            let mut detected = false;
             for pattern in &self.shellcode_patterns {
                 if let Some(offset) = Self::find_pattern(&buffer, pattern) {
                     let proc_info = self.get_process_info(pid);
@@ -389,8 +401,39 @@ impl MemoryScanner {
                     );
 
                     self.event_tx.send(event).await.ok();
+                    detected = true;
                     break; // One detection per region is enough
                 }
+            }
+
+            // C4 Fix: If no pattern matched, try heuristic detection
+            if !detected && Self::analyze_shellcode_heuristics(&buffer) {
+                let proc_info = self.get_process_info(pid);
+
+                let mut event = DetectionEvent::new(
+                    DetectionSource::MemoryScanner,
+                    ThreatType::ShellcodeDetected,
+                    Severity::High,
+                    format!(
+                        "Shellcode heuristic triggered in PID {} (region 0x{:x}-0x{:x}, high syscall/ROP density)",
+                        pid,
+                        region.start,
+                        region.end
+                    ),
+                )
+                .with_pattern("heuristic=syscall_density");
+
+                if let Some(info) = proc_info {
+                    event = event.with_process(info);
+                }
+
+                warn!(
+                    pid = pid,
+                    region_start = format!("0x{:x}", region.start),
+                    "Shellcode heuristic detection"
+                );
+
+                self.event_tx.send(event).await.ok();
             }
         }
 
@@ -406,6 +449,56 @@ impl MemoryScanner {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    /// C4 Fix: Analyze memory region for shellcode heuristics.
+    /// Returns true if the region has suspicious characteristics typical of shellcode.
+    fn analyze_shellcode_heuristics(data: &[u8]) -> bool {
+        if data.len() < 16 {
+            return false;
+        }
+
+        // Count syscall instructions
+        let mut syscall_count = 0;
+
+        // x86-64 syscall: 0f 05
+        for window in data.windows(2) {
+            if window == [0x0f, 0x05] {
+                syscall_count += 1;
+            }
+        }
+
+        // x86 int 0x80: cd 80
+        for window in data.windows(2) {
+            if window == [0xcd, 0x80] {
+                syscall_count += 1;
+            }
+        }
+
+        // High syscall density is suspicious (legitimate code rarely has many raw syscalls)
+        // Threshold: more than 1 syscall per 512 bytes is suspicious
+        let density = syscall_count as f64 / data.len() as f64;
+        if density > 0.002 && syscall_count >= 2 {
+            return true;
+        }
+
+        // Count ROP-like ret instructions followed by addresses
+        // Pattern: c3 (ret) appearing frequently
+        let ret_count = data.iter().filter(|&&b| b == 0xc3).count();
+        let ret_density = ret_count as f64 / data.len() as f64;
+        if ret_density > 0.01 && ret_count >= 5 {
+            return true;
+        }
+
+        // Check for high proportion of certain instruction prefixes
+        // Common in shellcode: push/pop instructions (0x50-0x5f range)
+        let push_pop_count = data.iter().filter(|&&b| (0x50..=0x5f).contains(&b)).count();
+        let push_pop_density = push_pop_count as f64 / data.len() as f64;
+        if push_pop_density > 0.15 && push_pop_count >= 10 {
+            return true;
+        }
+
+        false
     }
 
     /// Get process info for a PID
@@ -539,5 +632,29 @@ mod tests {
             pathname: "/usr/lib/libc.so.6".to_string(),
         };
         assert!(!scanner.is_suspicious_exec_region(&normal_lib));
+
+        // C3 fix: memfd: should be detected
+        let memfd_exec = MemoryRegion {
+            start: 0x7f0000000000,
+            end: 0x7f0000001000,
+            permissions: "r-xp".to_string(),
+            offset: 0,
+            device: "00:00".to_string(),
+            inode: 12345,
+            pathname: "/memfd:malware (deleted)".to_string(),
+        };
+        assert!(scanner.is_suspicious_exec_region(&memfd_exec));
+
+        // C3 fix: Small anonymous exec should now be detected (no size limit)
+        let small_anon_exec = MemoryRegion {
+            start: 0x7f0000000000,
+            end: 0x7f0000001000, // Only 4KB
+            permissions: "r-xp".to_string(),
+            offset: 0,
+            device: "00:00".to_string(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(scanner.is_suspicious_exec_region(&small_anon_exec));
     }
 }

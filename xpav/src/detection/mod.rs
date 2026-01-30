@@ -20,12 +20,22 @@ pub enum ThreatType {
     SuspiciousExecution,
     SuspiciousProcess,
     MiningPoolConnection,
+    /// Connection to stratum port with high CPU (behavioral heuristic)
+    SuspiciousMiningBehavior,
     C2Connection,
     PersistenceMechanism,
     SshKeyModification,
     CronModification,
     SystemdModification,
     LdPreloadModification,
+    /// PAM module modification
+    PamModification,
+    /// Shell profile modification (.bashrc, /etc/profile, etc.)
+    ShellProfileModification,
+    /// Init script modification (/etc/init.d, /etc/rc.local)
+    InitScriptModification,
+    /// GRUB/bootloader configuration modification
+    BootloaderModification,
     // Webshell
     Webshell,
     WebshellObfuscated,
@@ -43,6 +53,8 @@ pub enum ThreatType {
     ProcessInjection,
     SuspiciousMemoryRegion,
     ShellcodeDetected,
+    /// memfd: executable region (fileless malware technique)
+    MemfdExecution,
     // Integrity
     IntegrityViolation,
     KernelModuleLoad,
@@ -54,6 +66,8 @@ pub enum ThreatType {
     PrivilegedContainerOperation,
     HostMountAccess,
     SuspiciousCapability,
+    /// Cgroup escape attempt (release_agent abuse)
+    CgroupEscape,
     // Entropy/Packing
     PackedExecutable,
     HighEntropyExecutable,
