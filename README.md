@@ -66,8 +66,11 @@ Traditional antivirus (like ClamAV) relies on hash databases - if malware isn't 
 ## Installation
 
 ```bash
-# Build
-cargo build --release
+# Build (userspace only)
+cargo build --release -p xpav
+
+# Build with native eBPF support (requires nightly)
+cargo xtask build --release
 
 # Install binary
 sudo cp target/release/xpav /usr/local/bin/
@@ -147,36 +150,49 @@ Default address: `127.0.0.1:9090`
 
 - Linux (uses `/proc`, fanotify, eBPF)
 - Root for most monitors (fanotify, eBPF, memory scanning)
-- Rust 1.75+ to build
+- Rust nightly to build (for Edition 2024 and eBPF cross-compilation)
+- `rust-src` and `llvm-tools` components (installed automatically via `rust-toolchain.toml`)
 
 ## Feature Flags
 
 ```bash
-# Full build (default)
-cargo build --release
+# Full build (default features)
+cargo build --release -p xpav
 
 # Minimal build (no HTTP endpoints)
-cargo build --release --no-default-features
+cargo build --release -p xpav --no-default-features
+
+# With native eBPF monitoring
+cargo xtask build --release
+
+# With YARA scanning
+cargo build --release -p xpav --features yara
 ```
 
 | Feature | Description | Default |
 |---------|-------------|---------|
 | `metrics` | Prometheus metrics + health endpoints | Yes |
 | `webhooks` | HTTP webhook alerting | Yes |
+| `ebpf-native` | Native eBPF monitoring via Aya | No |
+| `yara` | YARA rule scanning | No |
 
 ## Architecture
 
 ```
-xpav
-├── Process Monitor    - /proc scanning for suspicious processes
-├── Network Monitor    - /proc/net for mining pool connections
-├── Persistence Monitor - inotify on SSH keys, cron, systemd
-├── File Monitor       - fanotify for real-time file scanning
-├── eBPF Monitor       - bpftool for rootkit detection
-├── Memory Scanner     - /proc/PID/maps for fileless malware
-├── Integrity Monitor  - File hash tracking
-├── Container Monitor  - Namespace and capability monitoring
-└── Response Handler   - Logging, webhooks, Prometheus metrics
+xpav/                  - Workspace root
+├── xpav/              - Main userspace daemon
+│   ├── Process Monitor    - /proc scanning for suspicious processes
+│   ├── Network Monitor    - /proc/net for mining pool connections
+│   ├── Persistence Monitor - inotify on SSH keys, cron, systemd
+│   ├── File Monitor       - fanotify for real-time file scanning
+│   ├── eBPF Monitor       - bpftool for rootkit detection
+│   ├── Memory Scanner     - /proc/PID/maps for fileless malware
+│   ├── Integrity Monitor  - File hash tracking
+│   ├── Container Monitor  - Namespace and capability monitoring
+│   └── Response Handler   - Logging, webhooks, Prometheus metrics
+├── xpav-ebpf/         - eBPF programs (kernel-space)
+├── xpav-common/       - Shared types between userspace and eBPF
+└── xtask/             - Build automation (eBPF cross-compilation)
 ```
 
 ## License
