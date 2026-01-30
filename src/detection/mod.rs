@@ -54,6 +54,11 @@ pub enum ThreatType {
     PrivilegedContainerOperation,
     HostMountAccess,
     SuspiciousCapability,
+    // Entropy/Packing
+    PackedExecutable,
+    HighEntropyExecutable,
+    // YARA
+    YaraRuleMatch,
     Unknown,
 }
 
@@ -182,12 +187,38 @@ impl DetectionEvent {
     }
 }
 
-/// Simple UUID generation without external dependency
+/// Generate a unique event ID using timestamp, counter, and random bytes.
 fn uuid_simple() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let rand_part: u64 = now.as_nanos() as u64 ^ std::process::id() as u64;
-    format!("{:016x}-{:08x}", now.as_nanos() as u64, rand_part as u32)
+
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    // Use getrandom for cryptographic randomness if available
+    let random_part: u32 = {
+        let mut buf = [0u8; 4];
+        if getrandom::getrandom(&mut buf).is_ok() {
+            u32::from_ne_bytes(buf)
+        } else {
+            // Fallback: mix counter, pid, and time
+            let mix = counter
+                .wrapping_mul(0x517cc1b727220a95)
+                .wrapping_add(std::process::id() as u64)
+                .wrapping_mul(0x2545f4914f6cdd1d);
+            mix as u32
+        }
+    };
+
+    format!(
+        "evt-{:012x}-{:04x}-{:08x}",
+        now.as_nanos() as u64 & 0xFFFFFFFFFFFF,
+        counter & 0xFFFF,
+        random_part
+    )
 }

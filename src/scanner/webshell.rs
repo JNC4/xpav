@@ -1,7 +1,37 @@
-//! Detects PHP webshells via pattern matching and obfuscation scoring.
+//! Detects webshells via pattern matching and obfuscation scoring.
+//!
+//! Supports multiple languages:
+//! - PHP (phtml, php3-7, phar, inc)
+//! - JSP (jsp, jspx, jspa, jsw, jsv)
+//! - ASP.NET (aspx, ashx, asmx, ascx, asp)
+//! - Python (py, pyw)
 
 use regex::Regex;
 use std::path::Path;
+
+/// Supported webshell languages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebshellLanguage {
+    Php,
+    Jsp,
+    AspNet,
+    Python,
+}
+
+impl WebshellLanguage {
+    /// Get the language from a file extension.
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.to_lowercase().as_str() {
+            "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "phps" | "phar" | "inc" => {
+                Some(WebshellLanguage::Php)
+            }
+            "jsp" | "jspx" | "jspa" | "jsw" | "jsv" => Some(WebshellLanguage::Jsp),
+            "aspx" | "ashx" | "asmx" | "ascx" | "asp" => Some(WebshellLanguage::AspNet),
+            "py" | "pyw" => Some(WebshellLanguage::Python),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WebshellScanResult {
@@ -9,6 +39,7 @@ pub struct WebshellScanResult {
     pub threat_level: ThreatLevel,
     pub detections: Vec<Detection>,
     pub obfuscation_score: u32,
+    pub language: Option<WebshellLanguage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,11 +68,19 @@ pub enum DetectionCategory {
 }
 
 pub struct WebshellScanner {
+    // PHP patterns
     input_eval_patterns: Vec<CompiledPattern>,
     decode_chain_patterns: Vec<CompiledPattern>,
     known_signatures: Vec<CompiledPattern>,
     suspicious_functions: Vec<CompiledPattern>,
     dynamic_execution_patterns: Vec<CompiledPattern>,
+    // JSP patterns
+    jsp_patterns: Vec<CompiledPattern>,
+    // ASP.NET patterns
+    asp_patterns: Vec<CompiledPattern>,
+    // Python patterns
+    python_patterns: Vec<CompiledPattern>,
+    // Obfuscation detection
     obfuscation_threshold: u32,
     hex_pattern: Regex,
     chr_chain: Regex,
@@ -70,6 +109,9 @@ impl WebshellScanner {
             known_signatures: compile_known_signatures(),
             suspicious_functions: compile_suspicious_functions(),
             dynamic_execution_patterns: compile_dynamic_execution_patterns(),
+            jsp_patterns: compile_jsp_patterns(),
+            asp_patterns: compile_asp_patterns(),
+            python_patterns: compile_python_patterns(),
             obfuscation_threshold,
             hex_pattern: Regex::new(r"(?:\\x[0-9a-fA-F]{2}){4,}").unwrap(),
             chr_chain: Regex::new(r"chr\s*\(\s*\d+\s*\)\s*\.\s*chr\s*\(\s*\d+\s*\)").unwrap(),
@@ -79,17 +121,21 @@ impl WebshellScanner {
         }
     }
 
-    pub fn should_scan(path: &Path) -> bool {
+    /// Check if a file should be scanned and return the detected language.
+    pub fn should_scan_language(path: &Path) -> Option<WebshellLanguage> {
         let extension = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        matches!(
-            extension.to_lowercase().as_str(),
-            "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "phps" | "phar" | "inc"
-        )
+        WebshellLanguage::from_extension(extension)
+    }
+
+    /// Legacy method - returns true if the file is any scannable type.
+    pub fn should_scan(path: &Path) -> bool {
+        Self::should_scan_language(path).is_some()
     }
 
     fn strip_inline_comments(content: &str) -> String {
-        let comment_re = Regex::new(r"/\*.*?\*/").unwrap();
-        comment_re.replace_all(content, "").to_string()
+        use once_cell::sync::Lazy;
+        static COMMENT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"/\*.*?\*/").unwrap());
+        COMMENT_RE.replace_all(content, "").to_string()
     }
 
     pub fn scan(&self, content: &str) -> WebshellScanResult {
@@ -199,6 +245,104 @@ impl WebshellScanner {
             threat_level,
             detections,
             obfuscation_score,
+            language: Some(WebshellLanguage::Php),
+        }
+    }
+
+    /// Scan content for the specified language.
+    pub fn scan_language(&self, content: &str, language: WebshellLanguage) -> WebshellScanResult {
+        match language {
+            WebshellLanguage::Php => self.scan(content),
+            WebshellLanguage::Jsp => self.scan_jsp(content),
+            WebshellLanguage::AspNet => self.scan_asp(content),
+            WebshellLanguage::Python => self.scan_python(content),
+        }
+    }
+
+    /// Scan JSP content for webshells.
+    pub fn scan_jsp(&self, content: &str) -> WebshellScanResult {
+        let mut detections = Vec::new();
+
+        for pattern in &self.jsp_patterns {
+            if let Some(captures) = pattern.regex.captures(content) {
+                let matched = captures.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let line = find_line_number(content, captures.get(0).map(|m| m.start()));
+                detections.push(Detection {
+                    category: pattern.category,
+                    pattern: matched,
+                    description: pattern.description.clone(),
+                    line_number: line,
+                });
+            }
+        }
+
+        let threat_level = self.determine_threat_level(&detections, 0);
+        let is_malicious = threat_level == ThreatLevel::Malicious;
+
+        WebshellScanResult {
+            is_malicious,
+            threat_level,
+            detections,
+            obfuscation_score: 0,
+            language: Some(WebshellLanguage::Jsp),
+        }
+    }
+
+    /// Scan ASP.NET content for webshells.
+    pub fn scan_asp(&self, content: &str) -> WebshellScanResult {
+        let mut detections = Vec::new();
+
+        for pattern in &self.asp_patterns {
+            if let Some(captures) = pattern.regex.captures(content) {
+                let matched = captures.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let line = find_line_number(content, captures.get(0).map(|m| m.start()));
+                detections.push(Detection {
+                    category: pattern.category,
+                    pattern: matched,
+                    description: pattern.description.clone(),
+                    line_number: line,
+                });
+            }
+        }
+
+        let threat_level = self.determine_threat_level(&detections, 0);
+        let is_malicious = threat_level == ThreatLevel::Malicious;
+
+        WebshellScanResult {
+            is_malicious,
+            threat_level,
+            detections,
+            obfuscation_score: 0,
+            language: Some(WebshellLanguage::AspNet),
+        }
+    }
+
+    /// Scan Python content for webshells.
+    pub fn scan_python(&self, content: &str) -> WebshellScanResult {
+        let mut detections = Vec::new();
+
+        for pattern in &self.python_patterns {
+            if let Some(captures) = pattern.regex.captures(content) {
+                let matched = captures.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let line = find_line_number(content, captures.get(0).map(|m| m.start()));
+                detections.push(Detection {
+                    category: pattern.category,
+                    pattern: matched,
+                    description: pattern.description.clone(),
+                    line_number: line,
+                });
+            }
+        }
+
+        let threat_level = self.determine_threat_level(&detections, 0);
+        let is_malicious = threat_level == ThreatLevel::Malicious;
+
+        WebshellScanResult {
+            is_malicious,
+            threat_level,
+            detections,
+            obfuscation_score: 0,
+            language: Some(WebshellLanguage::Python),
         }
     }
 
@@ -555,6 +699,216 @@ fn compile_dynamic_execution_patterns() -> Vec<CompiledPattern> {
     ]
 }
 
+/// Compile JSP webshell detection patterns.
+fn compile_jsp_patterns() -> Vec<CompiledPattern> {
+    vec![
+        // Runtime.getRuntime().exec() with request parameter
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)Runtime\s*\.\s*getRuntime\s*\(\s*\)\s*\.\s*exec\s*\([^)]*request\s*\."#).unwrap(),
+            description: "Runtime.exec() with request parameter".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // ProcessBuilder with request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)new\s+ProcessBuilder\s*\([^)]*request\s*\."#).unwrap(),
+            description: "ProcessBuilder with request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // ScriptEngine.eval with request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)ScriptEngine[^;]*\.eval\s*\([^)]*request\s*\."#).unwrap(),
+            description: "ScriptEngine.eval with request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // Direct exec with getParameter
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\.exec\s*\(\s*request\s*\.\s*getParameter"#).unwrap(),
+            description: "Command execution with getParameter".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // Class.forName with request input (reflection abuse)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)Class\s*\.\s*forName\s*\([^)]*request\s*\."#).unwrap(),
+            description: "Reflection with request input".to_string(),
+            category: DetectionCategory::DynamicExecution,
+        },
+        // ObjectInputStream (deserialization attack)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)new\s+ObjectInputStream\s*\([^)]*request\s*\."#).unwrap(),
+            description: "Deserialization of request data".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+        // Commons-collections gadget chain indicators
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(InvokerTransformer|ConstantTransformer|ChainedTransformer)"#).unwrap(),
+            description: "Commons-collections gadget chain".to_string(),
+            category: DetectionCategory::KnownSignature,
+        },
+        // JSP shell known signatures
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(JspSpy|JspFile|cmdshell|jspWebShell)"#).unwrap(),
+            description: "Known JSP webshell signature".to_string(),
+            category: DetectionCategory::KnownSignature,
+        },
+        // Reading /etc/passwd or similar
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)new\s+File(Input|Reader)\s*\([^)]*(/etc/passwd|/etc/shadow)"#).unwrap(),
+            description: "Accessing sensitive system files".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+        // JNDI injection
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(InitialContext|lookup)\s*\([^)]*request\s*\."#).unwrap(),
+            description: "JNDI lookup with user input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+    ]
+}
+
+/// Compile ASP.NET webshell detection patterns.
+fn compile_asp_patterns() -> Vec<CompiledPattern> {
+    vec![
+        // Process.Start with Request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)Process\s*\.\s*Start\s*\([^)]*Request\s*[\.\[]"#).unwrap(),
+            description: "Process.Start with Request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // Server.Execute with user input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)Server\s*\.\s*Execute\s*\([^)]*Request\s*[\.\[]"#).unwrap(),
+            description: "Server.Execute with Request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // Eval with Request input (VBScript/JScript)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\bEval\s*\([^)]*Request\s*[\.\[]"#).unwrap(),
+            description: "Eval with Request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // Execute with Request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\bExecute\s*\([^)]*Request\s*[\.\[]"#).unwrap(),
+            description: "Execute with Request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // cmd.exe or powershell invocation
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(cmd\.exe|powershell)[^;]*Request\s*[\.\[]"#).unwrap(),
+            description: "Shell command with Request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // Compile and execute code dynamically
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(CompileAssemblyFromSource|CSharpCodeProvider|VBCodeProvider)"#).unwrap(),
+            description: "Dynamic code compilation".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+        // Reflection invoke with user input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\.Invoke\s*\([^)]*Request\s*[\.\[]"#).unwrap(),
+            description: "Reflection invoke with Request input".to_string(),
+            category: DetectionCategory::DynamicExecution,
+        },
+        // Known ASP webshell signatures
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(aspxspy|c99shell|b374k|FilesMan)"#).unwrap(),
+            description: "Known ASP webshell signature".to_string(),
+            category: DetectionCategory::KnownSignature,
+        },
+        // File operations with user input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(File\.(Write|Delete|Move|Copy))[^;]*Request\s*[\.\[]"#).unwrap(),
+            description: "File operation with Request input".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+        // SQL query with user input (SQL injection)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)SqlCommand[^;]*(Request\s*[\.\[]|"[^"]*\+)"#).unwrap(),
+            description: "SQL command with user input".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+    ]
+}
+
+/// Compile Python webshell detection patterns.
+fn compile_python_patterns() -> Vec<CompiledPattern> {
+    vec![
+        // os.system with request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)os\s*\.\s*system\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "os.system with request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // subprocess with request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)subprocess\s*\.\s*(call|run|Popen|check_output)\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "subprocess with request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // eval with request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\beval\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "eval with request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // exec with request input
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\bexec\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "exec with request input".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+        // compile and exec
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)\bexec\s*\(\s*compile\s*\("#).unwrap(),
+            description: "exec with compile".to_string(),
+            category: DetectionCategory::DynamicExecution,
+        },
+        // __import__ with user input (dynamic import)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)__import__\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "__import__ with request input".to_string(),
+            category: DetectionCategory::DynamicExecution,
+        },
+        // getattr with user input (attribute access abuse)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)getattr\s*\([^,]+,\s*[^)]*request\s*[\.\[]"#).unwrap(),
+            description: "getattr with request input".to_string(),
+            category: DetectionCategory::DynamicExecution,
+        },
+        // pickle.loads (insecure deserialization)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)pickle\s*\.\s*loads?\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "pickle deserialization of request data".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+        // marshal.loads (insecure deserialization)
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)marshal\s*\.\s*loads?\s*\([^)]*request\s*[\.\[]"#).unwrap(),
+            description: "marshal deserialization of request data".to_string(),
+            category: DetectionCategory::SuspiciousFunction,
+        },
+        // Base64 decode to exec chain
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)exec\s*\([^)]*base64\s*\.\s*(b64decode|decodebytes)"#).unwrap(),
+            description: "exec with base64 decode".to_string(),
+            category: DetectionCategory::DecodeChain,
+        },
+        // Known Python webshell signatures
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(weevely|meterpreter|p0wny|pwncat)"#).unwrap(),
+            description: "Known Python webshell signature".to_string(),
+            category: DetectionCategory::KnownSignature,
+        },
+        // Flask/Django shell execution patterns
+        CompiledPattern {
+            regex: Regex::new(r#"(?i)(request\.(form|args|data|values|json))[^;]*(os\.|subprocess\.|eval|exec)"#).unwrap(),
+            description: "Web framework request to code execution".to_string(),
+            category: DetectionCategory::InputEvalChain,
+        },
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,5 +1020,97 @@ mod tests {
         let result = s.scan(r#"<?php passthru($_REQUEST['cmd']); ?>"#);
         assert_eq!(result.threat_level, ThreatLevel::Malicious);
         assert!(result.is_malicious);
+    }
+
+    // JSP tests
+    #[test]
+    fn test_jsp_runtime_exec() {
+        let s = scanner();
+        let result = s.scan_jsp(r#"<% Runtime.getRuntime().exec(request.getParameter("cmd")); %>"#);
+        assert_eq!(result.threat_level, ThreatLevel::Malicious);
+        assert!(result.is_malicious);
+        assert_eq!(result.language, Some(WebshellLanguage::Jsp));
+    }
+
+    #[test]
+    fn test_jsp_processbuilder() {
+        let s = scanner();
+        let result = s.scan_jsp(r#"<% new ProcessBuilder(request.getParameter("cmd")).start(); %>"#);
+        assert!(result.is_malicious);
+    }
+
+    #[test]
+    fn test_jsp_clean() {
+        let s = scanner();
+        let result = s.scan_jsp(r#"<% out.println("Hello World"); %>"#);
+        assert_eq!(result.threat_level, ThreatLevel::Clean);
+        assert!(!result.is_malicious);
+    }
+
+    // ASP.NET tests
+    #[test]
+    fn test_asp_process_start() {
+        let s = scanner();
+        let result = s.scan_asp(r#"<% Process.Start(Request["cmd"]); %>"#);
+        assert_eq!(result.threat_level, ThreatLevel::Malicious);
+        assert!(result.is_malicious);
+        assert_eq!(result.language, Some(WebshellLanguage::AspNet));
+    }
+
+    #[test]
+    fn test_asp_eval() {
+        let s = scanner();
+        let result = s.scan_asp(r#"<% Eval(Request.Form["code"]); %>"#);
+        assert!(result.is_malicious);
+    }
+
+    #[test]
+    fn test_asp_clean() {
+        let s = scanner();
+        let result = s.scan_asp(r#"<% Response.Write("Hello World"); %>"#);
+        assert_eq!(result.threat_level, ThreatLevel::Clean);
+        assert!(!result.is_malicious);
+    }
+
+    // Python tests
+    #[test]
+    fn test_python_os_system() {
+        let s = scanner();
+        let result = s.scan_python(r#"os.system(request.form['cmd'])"#);
+        assert_eq!(result.threat_level, ThreatLevel::Malicious);
+        assert!(result.is_malicious);
+        assert_eq!(result.language, Some(WebshellLanguage::Python));
+    }
+
+    #[test]
+    fn test_python_subprocess() {
+        let s = scanner();
+        let result = s.scan_python(r#"subprocess.call(request.args['cmd'], shell=True)"#);
+        assert!(result.is_malicious);
+    }
+
+    #[test]
+    fn test_python_eval() {
+        let s = scanner();
+        let result = s.scan_python(r#"eval(request.data)"#);
+        assert!(result.is_malicious);
+    }
+
+    #[test]
+    fn test_python_clean() {
+        let s = scanner();
+        let result = s.scan_python(r#"print("Hello World")"#);
+        assert_eq!(result.threat_level, ThreatLevel::Clean);
+        assert!(!result.is_malicious);
+    }
+
+    // Language detection tests
+    #[test]
+    fn test_should_scan_language() {
+        assert_eq!(WebshellScanner::should_scan_language(Path::new("test.php")), Some(WebshellLanguage::Php));
+        assert_eq!(WebshellScanner::should_scan_language(Path::new("test.jsp")), Some(WebshellLanguage::Jsp));
+        assert_eq!(WebshellScanner::should_scan_language(Path::new("test.aspx")), Some(WebshellLanguage::AspNet));
+        assert_eq!(WebshellScanner::should_scan_language(Path::new("test.py")), Some(WebshellLanguage::Python));
+        assert_eq!(WebshellScanner::should_scan_language(Path::new("test.txt")), None);
     }
 }

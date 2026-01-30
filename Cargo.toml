@@ -11,6 +11,8 @@ repository = "https://github.com/JNC4/xpav"
 default = ["metrics", "webhooks"]
 metrics = ["dep:axum", "dep:prometheus"]
 webhooks = ["dep:reqwest"]
+yara = ["dep:yara"]
+ebpf-native = ["dep:aya", "dep:aya-log"]
 
 [dependencies]
 # Async runtime - only features we actually need
@@ -58,6 +60,24 @@ libc = "0.2"
 # Lazy initialization
 once_cell = "1"
 
+# Glob pattern matching
+glob = "0.3"
+
+# Random number generation
+getrandom = "0.2"
+
+# Concurrent data structures
+dashmap = "6"
+crossbeam = "0.8"
+lru = "0.12"
+
+# Bytes buffer
+bytes = "1"
+
+# Netlink for process events
+netlink-sys = "0.8"
+netlink-packet-core = "0.7"
+
 # Optional: HTTP client for webhooks (rustls = smaller than OpenSSL)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
@@ -65,8 +85,38 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 axum = { version = "0.8", optional = true }
 prometheus = { version = "0.13", optional = true }
 
+# Optional: YARA scanning
+yara = { version = "0.28", optional = true }
+
+# Optional: Native eBPF with Aya
+aya = { version = "0.12", optional = true }
+aya-log = { version = "0.2", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
+criterion = "0.5"
+mockall = "0.13"
+
+[[test]]
+name = "correlation_tests"
+path = "tests/correlation_tests.rs"
+
+[[test]]
+name = "proptest_tests"
+path = "tests/proptest_tests.rs"
+
+[[test]]
+name = "unit_tests"
+path = "tests/unit_tests.rs"
+
+[[bench]]
+name = "scanner_bench"
+harness = false
+
+[[bench]]
+name = "state_store_bench"
+harness = false
 
 [profile.release]
 lto = true

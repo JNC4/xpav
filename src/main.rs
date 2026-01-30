@@ -1,10 +1,12 @@
 use xpav::config::Config;
+use xpav::config_broadcast::ConfigBroadcaster;
 use xpav::metrics::{self, ACTIVE_MONITORS};
 use xpav::monitors::{
     ContainerMonitor, EbpfMonitor, FanotifyMonitor, IntegrityMonitor, MemoryScanner,
     NetworkMonitor, PersistenceMonitor, ProcessMonitor,
 };
 use xpav::response::ResponseHandler;
+use xpav::state::StateStore;
 use anyhow::Result;
 use clap::Parser;
 use std::net::SocketAddr;
@@ -112,6 +114,13 @@ async fn main() -> Result<()> {
         config.general.dry_run = true;
     }
 
+    // Create shared state store
+    let state = StateStore::new().shared();
+    info!("State store initialized");
+
+    // Create config broadcaster for hot-reload
+    let (config_broadcaster, _config_rx) = ConfigBroadcaster::new(config.clone());
+
     if !args.json {
         eprintln!(r#"
   __  __ ____   ___  __    __
@@ -171,7 +180,18 @@ async fn main() -> Result<()> {
         info!("Health check at http://{}/health", args.metrics_addr);
     }
 
+    // Spawn periodic state cleanup task
+    let state_cleanup = Arc::clone(&state);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            state_cleanup.cleanup_expired();
+        }
+    });
+
     let config_path_clone = config_path.clone();
+    let mut config_broadcaster = config_broadcaster;
     tokio::spawn(async move {
         loop {
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -180,8 +200,11 @@ async fn main() -> Result<()> {
                     info!("Received SIGHUP, reloading config...");
                     match Config::load(&config_path_clone) {
                         Ok(new_config) => {
-                            info!("Config reloaded successfully");
-                            // Full reload would need monitors to watch shared config
+                            if let Err(e) = config_broadcaster.update(new_config.clone()) {
+                                warn!("Failed to broadcast config update: {}", e);
+                            } else {
+                                info!("Config reloaded and broadcast to monitors");
+                            }
                             if new_config.general.dry_run {
                                 info!("Config has dry_run=true");
                             }

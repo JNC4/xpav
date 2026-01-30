@@ -1,25 +1,111 @@
 //! Response actions - handles threat detection events
 
-use crate::config::LogFormat;
+pub mod actions;
+
+pub use actions::{ActionResult, ResponseAction, ResponseActions};
+
+use crate::config::{LogFormat, RateLimitConfig};
 use crate::detection::{DetectionEvent, Severity};
 use crate::metrics::{DETECTIONS_TOTAL, EVENTS_PROCESSED, WEBHOOK_FAILURES, WEBHOOK_SUCCESS};
+use crate::state::dedup::{DedupKey, EventDeduplicator};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{debug, info};
 
 #[cfg(feature = "webhooks")]
 use tracing::{error, warn};
+
+/// Rate limiter for detection events.
+pub struct RateLimiter {
+    dedup: EventDeduplicator,
+    config: RateLimitConfig,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter with the given configuration.
+    pub fn new(config: RateLimitConfig) -> Self {
+        // Use the longest cooldown as the TTL
+        let max_ttl = config.low_seconds
+            .max(config.medium_seconds)
+            .max(config.high_seconds)
+            .max(config.critical_seconds);
+
+        Self {
+            dedup: EventDeduplicator::with_config(max_ttl, 10000),
+            config,
+        }
+    }
+
+    /// Check if an event should be reported (not rate limited).
+    pub fn should_report(&self, event: &DetectionEvent) -> bool {
+        if !self.config.enabled {
+            return true;
+        }
+
+        let ttl = self.cooldown_for_severity(&event.severity);
+        let key = self.make_key(event);
+        self.dedup.should_report_with_ttl(key, ttl as i64)
+    }
+
+    /// Get the cooldown period for a severity level.
+    fn cooldown_for_severity(&self, severity: &Severity) -> u64 {
+        match severity {
+            Severity::Low => self.config.low_seconds,
+            Severity::Medium => self.config.medium_seconds,
+            Severity::High => self.config.high_seconds,
+            Severity::Critical => self.config.critical_seconds,
+        }
+    }
+
+    /// Create a deduplication key for an event.
+    fn make_key(&self, event: &DetectionEvent) -> DedupKey {
+        // Key is based on: source, threat_type, and relevant identifier
+        let identifier = event.process.as_ref()
+            .map(|p| p.pid.to_string())
+            .or_else(|| event.file.as_ref().map(|f| f.path.display().to_string()))
+            .or_else(|| event.connection.as_ref().map(|c| format!("{}:{}", c.remote_addr, c.remote_port)));
+
+        DedupKey::from_event(
+            &format!("{:?}", event.source),
+            &format!("{:?}", event.threat_type),
+            identifier.as_deref(),
+        )
+    }
+
+    /// Get the number of rate-limited events.
+    pub fn limited_count(&self) -> usize {
+        self.dedup.len()
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new(RateLimitConfig::default())
+    }
+}
 
 pub struct ResponseHandler {
     log_format: LogFormat,
     webhook_url: Option<String>,
     #[allow(dead_code)]
     dry_run: bool,
+    rate_limiter: RateLimiter,
     #[cfg(feature = "webhooks")]
     http_client: reqwest::Client,
 }
 
 impl ResponseHandler {
+    /// Create a new response handler.
     pub fn new(log_format: LogFormat, webhook_url: Option<String>, dry_run: bool) -> Self {
+        Self::with_rate_limit(log_format, webhook_url, dry_run, RateLimitConfig::default())
+    }
+
+    /// Create a new response handler with custom rate limiting.
+    pub fn with_rate_limit(
+        log_format: LogFormat,
+        webhook_url: Option<String>,
+        dry_run: bool,
+        rate_limit_config: RateLimitConfig,
+    ) -> Self {
         #[cfg(feature = "webhooks")]
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -30,6 +116,7 @@ impl ResponseHandler {
             log_format,
             webhook_url,
             dry_run,
+            rate_limiter: RateLimiter::new(rate_limit_config),
             #[cfg(feature = "webhooks")]
             http_client,
         }
@@ -44,6 +131,13 @@ impl ResponseHandler {
 
     async fn handle_event(&self, event: &DetectionEvent) {
         EVENTS_PROCESSED.inc();
+
+        // Check rate limiting
+        if !self.rate_limiter.should_report(event) {
+            debug!("Event rate limited: {:?} from {:?}", event.threat_type, event.source);
+            return;
+        }
+
         DETECTIONS_TOTAL
             .with_label_values(&[&event.source.to_string(), &severity_label(&event.severity)])
             .inc();

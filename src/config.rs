@@ -1,5 +1,6 @@
 //! TOML-based configuration for all monitors.
 
+use crate::allowlist::AllowlistConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -42,7 +43,12 @@ const SUSPICIOUS_CHILD_PROCESSES: &[&str] = &[
 
 const WATCH_PATHS: &[&str] = &["/var/www", "/srv/http", "/srv/www", "/home/*/public_html"];
 
-const SCAN_EXTENSIONS: &[&str] = &["php", "phtml", "php3", "php4", "php5", "php7", "phar", "inc"];
+const SCAN_EXTENSIONS: &[&str] = &[
+    "php", "phtml", "php3", "php4", "php5", "php7", "phar", "inc",
+    "jsp", "jspx", "jspa", "jsw", "jsv",  // Java Server Pages
+    "aspx", "ashx", "asmx", "ascx", "asp", // ASP.NET
+    "py", "pyw",  // Python
+];
 
 const SENSITIVE_KPROBE_FUNCTIONS: &[&str] = &[
     "getdents", "getdents64", "filldir", "filldir64",
@@ -96,6 +102,10 @@ pub struct Config {
     #[serde(default)]
     pub general: GeneralConfig,
     #[serde(default)]
+    pub allowlists: AllowlistConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
+    #[serde(default)]
     pub process_monitor: ProcessMonitorConfig,
     #[serde(default)]
     pub network_monitor: NetworkMonitorConfig,
@@ -111,6 +121,10 @@ pub struct Config {
     pub integrity_monitor: IntegrityMonitorConfig,
     #[serde(default)]
     pub container_monitor: ContainerMonitorConfig,
+    #[serde(default)]
+    pub yara: YaraConfig,
+    #[serde(default)]
+    pub correlation: CorrelationConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,6 +186,9 @@ pub struct ProcessMonitorConfig {
     pub alert_high_cpu_unknown: bool,
     #[serde(default = "default_high_cpu_threshold")]
     pub high_cpu_threshold: f64,
+    /// Use netlink proc_events instead of polling (falls back to polling if unavailable)
+    #[serde(default = "default_true")]
+    pub use_netlink: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +239,12 @@ pub struct FileMonitorConfig {
     pub obfuscation_threshold: u32,
     #[serde(default)]
     pub action: ResponseAction,
+    /// Enable entropy analysis for detecting packed/encrypted executables
+    #[serde(default)]
+    pub entropy_analysis: bool,
+    /// Entropy threshold (0.0-8.0, higher = more suspicious)
+    #[serde(default = "default_entropy_threshold")]
+    pub entropy_threshold: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +333,111 @@ pub struct ContainerMonitorConfig {
     pub action: ResponseAction,
 }
 
+/// Rate limiting configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Enable rate limiting
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Cooldown in seconds for low severity events
+    #[serde(default = "default_low_cooldown")]
+    pub low_seconds: u64,
+    /// Cooldown in seconds for medium severity events
+    #[serde(default = "default_medium_cooldown")]
+    pub medium_seconds: u64,
+    /// Cooldown in seconds for high severity events
+    #[serde(default = "default_high_cooldown")]
+    pub high_seconds: u64,
+    /// Cooldown in seconds for critical severity events
+    #[serde(default = "default_critical_cooldown")]
+    pub critical_seconds: u64,
+}
+
+fn default_low_cooldown() -> u64 { 300 }
+fn default_medium_cooldown() -> u64 { 120 }
+fn default_high_cooldown() -> u64 { 60 }
+fn default_critical_cooldown() -> u64 { 30 }
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            low_seconds: 300,
+            medium_seconds: 120,
+            high_seconds: 60,
+            critical_seconds: 30,
+        }
+    }
+}
+
+/// YARA scanning configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YaraConfig {
+    /// Enable YARA scanning (requires yara feature)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Directory containing YARA rules
+    #[serde(default = "default_yara_rules_dir")]
+    pub rules_dir: PathBuf,
+    /// Scan files on creation
+    #[serde(default = "default_true")]
+    pub scan_on_file_create: bool,
+    /// Scan process memory
+    #[serde(default)]
+    pub scan_memory: bool,
+    /// Maximum file size to scan in MB
+    #[serde(default = "default_max_file_size_mb")]
+    pub max_file_size_mb: u64,
+    /// Timeout for YARA scans in seconds
+    #[serde(default = "default_yara_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_yara_rules_dir() -> PathBuf { PathBuf::from("/etc/xpav/rules") }
+fn default_max_file_size_mb() -> u64 { 10 }
+fn default_yara_timeout() -> u64 { 30 }
+
+impl Default for YaraConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rules_dir: default_yara_rules_dir(),
+            scan_on_file_create: true,
+            scan_memory: false,
+            max_file_size_mb: 10,
+            timeout_secs: 30,
+        }
+    }
+}
+
+/// Correlation engine configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorrelationConfig {
+    /// Enable correlation engine
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Time window for correlation in seconds
+    #[serde(default = "default_correlation_window")]
+    pub window_secs: u64,
+    /// Maximum events to keep in window
+    #[serde(default = "default_max_correlation_events")]
+    pub max_events: usize,
+}
+
+fn default_correlation_window() -> u64 { 300 }
+fn default_max_correlation_events() -> usize { 1000 }
+fn default_entropy_threshold() -> f64 { 7.0 }
+
+impl Default for CorrelationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_secs: 300,
+            max_events: 1000,
+        }
+    }
+}
+
 fn default_true() -> bool { true }
 fn default_scan_interval() -> u64 { DEFAULT_SCAN_INTERVAL_MS }
 fn default_cpu_threshold() -> f64 { DEFAULT_CPU_THRESHOLD }
@@ -363,6 +491,7 @@ impl Default for ProcessMonitorConfig {
             cpu_threshold: DEFAULT_CPU_THRESHOLD,
             alert_high_cpu_unknown: false,
             high_cpu_threshold: DEFAULT_HIGH_CPU_THRESHOLD,
+            use_netlink: true,
         }
     }
 }
@@ -403,6 +532,8 @@ impl Default for FileMonitorConfig {
             scan_extensions: default_scan_extensions(),
             obfuscation_threshold: DEFAULT_OBFUSCATION_THRESHOLD,
             action: ResponseAction::Alert,
+            entropy_analysis: false,
+            entropy_threshold: default_entropy_threshold(),
         }
     }
 }
@@ -474,6 +605,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             general: GeneralConfig::default(),
+            allowlists: AllowlistConfig::default(),
+            rate_limit: RateLimitConfig::default(),
             process_monitor: ProcessMonitorConfig::default(),
             network_monitor: NetworkMonitorConfig::default(),
             persistence_monitor: PersistenceMonitorConfig::default(),
@@ -482,6 +615,8 @@ impl Default for Config {
             memory_scanner: MemoryScannerConfig::default(),
             integrity_monitor: IntegrityMonitorConfig::default(),
             container_monitor: ContainerMonitorConfig::default(),
+            yara: YaraConfig::default(),
+            correlation: CorrelationConfig::default(),
         }
     }
 }
