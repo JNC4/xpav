@@ -4,6 +4,7 @@ use crate::config::{NetworkMonitorConfig, ResponseAction};
 use crate::detection::{
     ConnectionInfo, DetectionEvent, DetectionSource, ProcessInfo, Severity, ThreatType,
 };
+use crate::util::parse_status_field;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -388,15 +389,6 @@ fn get_process_info(pid: u32) -> Result<ProcessInfo> {
         start_time: None,
         ancestors: Vec::new(),
     })
-}
-
-fn parse_status_field(status: &str, field: &str) -> Option<u32> {
-    for line in status.lines() {
-        if line.starts_with(field) {
-            return line.split_whitespace().nth(1)?.parse().ok();
-        }
-    }
-    None
 }
 
 #[cfg(test)]

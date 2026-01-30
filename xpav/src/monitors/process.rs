@@ -5,6 +5,7 @@ use crate::config::{ProcessMonitorConfig, ResponseAction};
 use crate::detection::{
     DetectionEvent, DetectionSource, ProcessAncestor, ProcessInfo, Severity, ThreatType,
 };
+use crate::util::parse_status_field;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -667,20 +668,6 @@ impl ProcessMonitor {
             error!(pid = pid, "Failed to kill process: {}", e);
         }
     }
-}
-
-fn parse_status_field(status: &str, field: &str) -> Option<u32> {
-    for line in status.lines() {
-        if line.starts_with(field) {
-            let value = line
-                .split_whitespace()
-                .nth(1)?
-                .parse()
-                .ok()?;
-            return Some(value);
-        }
-    }
-    None
 }
 
 fn get_username(uid: u32) -> Option<String> {

@@ -495,69 +495,34 @@ impl WebshellScanner {
 
     /// Scan JSP content for webshells.
     pub fn scan_jsp(&self, content: &str) -> WebshellScanResult {
-        let mut detections = Vec::new();
-
-        for pattern in &self.jsp_patterns {
-            if let Some(captures) = pattern.regex.captures(content) {
-                let matched = captures.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
-                let line = find_line_number(content, captures.get(0).map(|m| m.start()));
-                detections.push(Detection {
-                    category: pattern.category,
-                    pattern: matched,
-                    description: pattern.description.clone(),
-                    line_number: line,
-                });
-            }
-        }
-
-        let threat_level = self.determine_threat_level(&detections, 0);
-        let is_malicious = threat_level == ThreatLevel::Malicious;
-
-        WebshellScanResult {
-            is_malicious,
-            threat_level,
-            detections,
-            obfuscation_score: 0,
-            language: Some(WebshellLanguage::Jsp),
-        }
+        self.scan_with_patterns(content, &self.jsp_patterns, WebshellLanguage::Jsp)
     }
 
     /// Scan ASP.NET content for webshells.
     pub fn scan_asp(&self, content: &str) -> WebshellScanResult {
-        let mut detections = Vec::new();
-
-        for pattern in &self.asp_patterns {
-            if let Some(captures) = pattern.regex.captures(content) {
-                let matched = captures.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
-                let line = find_line_number(content, captures.get(0).map(|m| m.start()));
-                detections.push(Detection {
-                    category: pattern.category,
-                    pattern: matched,
-                    description: pattern.description.clone(),
-                    line_number: line,
-                });
-            }
-        }
-
-        let threat_level = self.determine_threat_level(&detections, 0);
-        let is_malicious = threat_level == ThreatLevel::Malicious;
-
-        WebshellScanResult {
-            is_malicious,
-            threat_level,
-            detections,
-            obfuscation_score: 0,
-            language: Some(WebshellLanguage::AspNet),
-        }
+        self.scan_with_patterns(content, &self.asp_patterns, WebshellLanguage::AspNet)
     }
 
     /// Scan Python content for webshells.
     pub fn scan_python(&self, content: &str) -> WebshellScanResult {
+        self.scan_with_patterns(content, &self.python_patterns, WebshellLanguage::Python)
+    }
+
+    /// Generic pattern-based scan for non-PHP languages.
+    fn scan_with_patterns(
+        &self,
+        content: &str,
+        patterns: &[CompiledPattern],
+        language: WebshellLanguage,
+    ) -> WebshellScanResult {
         let mut detections = Vec::new();
 
-        for pattern in &self.python_patterns {
+        for pattern in patterns {
             if let Some(captures) = pattern.regex.captures(content) {
-                let matched = captures.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+                let matched = captures
+                    .get(0)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
                 let line = find_line_number(content, captures.get(0).map(|m| m.start()));
                 detections.push(Detection {
                     category: pattern.category,
@@ -576,7 +541,7 @@ impl WebshellScanner {
             threat_level,
             detections,
             obfuscation_score: 0,
-            language: Some(WebshellLanguage::Python),
+            language: Some(language),
         }
     }
 

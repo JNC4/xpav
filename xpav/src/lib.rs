@@ -16,6 +16,7 @@ pub mod persistence;
 pub mod response;
 pub mod scanner;
 pub mod state;
+pub mod util;
 
 // Re-export commonly used types
 pub use config::*;

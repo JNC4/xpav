@@ -14,7 +14,7 @@ pub use window::SlidingWindow;
 
 use crate::detection::DetectionEvent;
 use crate::state::StateStore;
-use chrono;
+use chrono::{Duration, Utc};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -69,7 +69,7 @@ impl CorrelationEngine {
         for pattern in &self.patterns {
             // Filter events to the pattern's specific time window
             // Each pattern has its own window_secs (e.g., APT=600s, Rootkit=60s)
-            let cutoff = chrono::Utc::now() - chrono::Duration::seconds(pattern.window_secs as i64);
+            let cutoff = Utc::now() - Duration::seconds(pattern.window_secs as i64);
             let events_in_window: Vec<DetectionEvent> = self.window
                 .filter_iter(|e| e.timestamp > cutoff)
                 .cloned()

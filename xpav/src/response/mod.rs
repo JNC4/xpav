@@ -394,13 +394,13 @@ impl ResponseHandler {
     }
 }
 
-fn severity_label(s: &Severity) -> String {
+fn severity_label(s: &Severity) -> &'static str {
     match s {
         Severity::Low => "low",
         Severity::Medium => "medium",
         Severity::High => "high",
         Severity::Critical => "critical",
-    }.to_string()
+    }
 }
 
 impl std::fmt::Display for crate::detection::DetectionSource {
